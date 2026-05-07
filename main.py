@@ -3,8 +3,6 @@ import time
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from dotenv import load_dotenv
 import schedule
 import pytz
