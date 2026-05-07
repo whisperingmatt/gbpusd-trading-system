@@ -239,10 +239,13 @@ GBP/USD Trading System v1.0
 
 # ─── EMAIL SENDER ─────────────────────────────────────────────────────────────
 def send_email(msg):
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+    with smtplib.SMTP("smtp.gmail.com", 587) as server:
+        server.ehlo()
+        server.starttls()
         server.login(EMAIL_SENDER, EMAIL_PASSWORD)
         server.sendmail(EMAIL_SENDER, EMAIL_RECIPIENT, msg.as_string())
     print(f"✅ Email sent at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+Commit it, Railway will redeploy, and check the logs again in 30 seconds.Sonnet 4.6Adaptive
 
 # ─── MAIN JOB ─────────────────────────────────────────────────────────────────
 def run_signal_job():
