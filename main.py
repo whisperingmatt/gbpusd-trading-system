@@ -245,7 +245,6 @@ def send_email(msg):
         server.login(EMAIL_SENDER, EMAIL_PASSWORD)
         server.sendmail(EMAIL_SENDER, EMAIL_RECIPIENT, msg.as_string())
     print(f"✅ Email sent at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-Commit it, Railway will redeploy, and check the logs again in 30 seconds.Sonnet 4.6Adaptive
 
 # ─── MAIN JOB ─────────────────────────────────────────────────────────────────
 def run_signal_job():
