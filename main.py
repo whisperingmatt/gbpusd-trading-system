@@ -27,11 +27,11 @@ OANDA_BASE = (
 INSTRUMENT = "GBP_USD"
 
 
-# ─── OANDA: FETCH DAILY CANDLES ──────────────────────────────────────────────
-def fetch_candles(count=250):
+# ─── FETCH CANDLES (reusable for any granularity) ────────────────────────────
+def fetch_candles(granularity="D", count=250):
     url     = f"{OANDA_BASE}/instruments/{INSTRUMENT}/candles"
     headers = {"Authorization": f"Bearer {OANDA_API_KEY}"}
-    params  = {"granularity": "D", "count": count, "price": "M"}
+    params  = {"granularity": granularity, "count": count, "price": "M"}
 
     response = requests.get(url, headers=headers, params=params)
     response.raise_for_status()
@@ -40,7 +40,7 @@ def fetch_candles(count=250):
     for c in response.json()["candles"]:
         if c["complete"]:
             rows.append({
-                "time":   c["time"][:10],
+                "time":   c["time"][:19],
                 "open":   float(c["mid"]["o"]),
                 "high":   float(c["mid"]["h"]),
                 "low":    float(c["mid"]["l"]),
@@ -54,7 +54,7 @@ def fetch_candles(count=250):
     return df
 
 
-# ─── TECHNICAL INDICATORS ────────────────────────────────────────────────────
+# ─── INDICATORS ──────────────────────────────────────────────────────────────
 def calculate_indicators(df):
     df["ema20"]  = df["close"].ewm(span=20,  adjust=False).mean()
     df["ema50"]  = df["close"].ewm(span=50,  adjust=False).mean()
@@ -78,6 +78,65 @@ def calculate_indicators(df):
     return df
 
 
+# ─── 4H CONFIRMATION ─────────────────────────────────────────────────────────
+def get_4h_confirmation(df_4h):
+    """
+    Checks the most recent 4H candle for directional confirmation.
+    Returns: 'BULL', 'BEAR', or 'NEUTRAL' plus a detail string.
+
+    Rules (need 2 of 3 to confirm):
+      1. Price vs 4H 50 EMA
+      2. 4H 50 EMA vs 4H 200 EMA
+      3. 4H RSI in favourable zone
+    """
+    latest   = df_4h.iloc[-1]
+    previous = df_4h.iloc[-2]
+
+    price    = latest["close"]
+    ema20_4h = latest["ema20"]
+    ema50_4h = latest["ema50"]
+    ema200_4h = latest["ema200"]
+    rsi_4h   = latest["rsi"]
+
+    ema20_dir = "▲" if ema20_4h > previous["ema20"] else "▼"
+    ema50_dir = "▲" if ema50_4h > previous["ema50"] else "▼"
+
+    bull_checks = 0
+    bear_checks = 0
+
+    # Check 1: Price vs 4H 50 EMA
+    if price > ema50_4h:
+        bull_checks += 1
+    else:
+        bear_checks += 1
+
+    # Check 2: 4H 50 EMA vs 4H 200 EMA
+    if ema50_4h > ema200_4h:
+        bull_checks += 1
+    else:
+        bear_checks += 1
+
+    # Check 3: 4H RSI
+    if 40 <= rsi_4h <= 65:
+        bull_checks += 1
+    elif rsi_4h < 35:
+        bull_checks += 1
+    elif rsi_4h > 68:
+        bear_checks += 1
+
+    if bull_checks >= 2:
+        direction = "BULL"
+        detail    = f"4H EMA {ema50_dir}: {round(ema50_4h,5)} | 4H RSI: {round(rsi_4h,1)} | {bull_checks}/3 bull checks"
+    elif bear_checks >= 2:
+        direction = "BEAR"
+        detail    = f"4H EMA {ema50_dir}: {round(ema50_4h,5)} | 4H RSI: {round(rsi_4h,1)} | {bear_checks}/3 bear checks"
+    else:
+        direction = "NEUTRAL"
+        detail    = f"4H EMA {ema50_dir}: {round(ema50_4h,5)} | 4H RSI: {round(rsi_4h,1)} | Mixed — no clear direction"
+
+    return direction, detail, round(ema50_4h,5), round(rsi_4h,1)
+
+
 # ─── LONG-TERM TREND (200 EMA) ───────────────────────────────────────────────
 def classify_long_term_trend(df):
     price        = df.iloc[-1]["close"]
@@ -93,18 +152,18 @@ def classify_long_term_trend(df):
     range_mid = low_200 + range_200 * 0.5
     range_pct = range_200 / ema200_now * 100
 
-    is_wide_range = range_pct > 8.0
-    is_slope_flat = abs(slope_50) < 0.3
-    in_upper_half = price > range_mid
+    is_wide   = range_pct > 8.0
+    is_flat   = abs(slope_50) < 0.3
+    in_upper  = price > range_mid
 
-    if is_wide_range and is_slope_flat:
-        position = "upper half" if in_upper_half else "lower half"
+    if is_wide and is_flat:
+        position = "upper half" if in_upper else "lower half"
         return "SIDEWAYS", f"Channel {round(low_200,4)}-{round(high_200,4)} | In {position}"
     elif price > ema200_now and slope_20 > 0.05 and slope_50 > 0.1:
         return "BULLISH", "200 EMA rising | Price above"
     elif price < ema200_now and slope_20 < -0.05 and slope_50 < -0.1:
         return "BEARISH", "200 EMA falling | Price below"
-    elif is_wide_range and in_upper_half:
+    elif is_wide and in_upper:
         return "SIDEWAYS", f"Channel {round(low_200,4)}-{round(high_200,4)} | In upper half"
     else:
         return "SIDEWAYS", f"Channel {round(low_200,4)}-{round(high_200,4)} | In lower half"
@@ -127,34 +186,14 @@ def classify_short_term_trend(df):
 
 # ─── KEY LEVELS & BREAK-AND-RETEST ───────────────────────────────────────────
 def detect_key_levels_and_bnr(df, lookback=200, tolerance_atr=0.75):
-    """
-    Identifies significant support and resistance levels from the last
-    `lookback` candles by finding swing highs and lows — price points
-    where the market reversed at least twice (tested the level multiple times).
-
-    Break-and-retest logic:
-    - BULLISH BNR: price recently broke ABOVE a resistance level, then
-      pulled back to retest it as support. Old resistance = new support.
-    - BEARISH BNR: price recently broke BELOW a support level, then
-      rallied back to retest it as resistance. Old support = new resistance.
-
-    A retest is valid if:
-    - The break happened within the last 20 candles
-    - Price has since pulled back within tolerance_atr of the broken level
-    - Price has not closed back through the broken level
-    """
-    price = df.iloc[-1]["close"]
-    atr   = df.iloc[-1]["atr"]
-    tol   = tolerance_atr * atr
-
+    price  = df.iloc[-1]["close"]
+    atr    = df.iloc[-1]["atr"]
+    tol    = tolerance_atr * atr
     recent = df.iloc[-lookback:].reset_index()
+    window = 5
 
-    # Find swing highs (local maxima) and swing lows (local minima)
-    # A swing high: high[i] is highest of 5-candle window centred on i
-    # A swing low:  low[i]  is lowest  of 5-candle window centred on i
     swing_highs = []
     swing_lows  = []
-    window = 5
 
     for i in range(window, len(recent) - window):
         hi = recent.iloc[i]["high"]
@@ -164,8 +203,7 @@ def detect_key_levels_and_bnr(df, lookback=200, tolerance_atr=0.75):
         if lo == recent.iloc[i-window:i+window+1]["low"].min():
             swing_lows.append(round(lo, 5))
 
-    # Cluster nearby levels (within 0.5 ATR of each other = same level)
-    def cluster_levels(levels):
+    def cluster(levels):
         if not levels:
             return []
         levels = sorted(set(levels))
@@ -180,39 +218,31 @@ def detect_key_levels_and_bnr(df, lookback=200, tolerance_atr=0.75):
         clustered.append(round(sum(group) / len(group), 5))
         return clustered
 
-    resistance_levels = cluster_levels([h for h in swing_highs if h > price])
-    support_levels    = cluster_levels([l for l in swing_lows  if l < price])
+    resistance = cluster([h for h in swing_highs if h > price])
+    support    = cluster([l for l in swing_lows  if l < price])
 
-    # Nearest levels above and below current price
-    nearest_resistance = min(resistance_levels, key=lambda x: abs(x - price)) if resistance_levels else None
-    nearest_support    = max(support_levels,    key=lambda x: abs(x - price)) if support_levels    else None
+    nearest_r = min(resistance, key=lambda x: abs(x - price)) if resistance else None
+    nearest_s = max(support,    key=lambda x: abs(x - price)) if support    else None
 
-    # Break-and-retest detection
-    # Look at last 20 candles for a level break followed by a retest
-    bnr_bull  = None
-    bnr_bear  = None
-    last_20   = df.iloc[-20:]
-    all_levels = swing_highs + swing_lows
+    bnr_bull = None
+    bnr_bear = None
+    last_20  = df.iloc[-20:]
+    all_lvls = swing_highs + swing_lows
 
-    for level in set([round(l, 5) for l in all_levels]):
-        candles_above = (last_20["close"] > level).sum()
-        candles_below = (last_20["close"] < level).sum()
+    for level in set([round(l, 5) for l in all_lvls]):
+        above = (last_20["close"] > level).sum()
+        below = (last_20["close"] < level).sum()
 
-        # Bullish BNR: broke above, now retesting from above
-        if candles_above >= 3 and candles_below >= 2:
-            if price > level and abs(price - level) <= tol:
-                if bnr_bull is None or abs(price - level) < abs(price - bnr_bull):
-                    bnr_bull = level
-
-        # Bearish BNR: broke below, now retesting from below
-        if candles_below >= 3 and candles_above >= 2:
-            if price < level and abs(price - level) <= tol:
-                if bnr_bear is None or abs(price - level) < abs(price - bnr_bear):
-                    bnr_bear = level
+        if above >= 3 and below >= 2 and price > level and abs(price - level) <= tol:
+            if bnr_bull is None or abs(price - level) < abs(price - bnr_bull):
+                bnr_bull = level
+        if below >= 3 and above >= 2 and price < level and abs(price - level) <= tol:
+            if bnr_bear is None or abs(price - level) < abs(price - bnr_bear):
+                bnr_bear = level
 
     return {
-        "nearest_resistance": nearest_resistance,
-        "nearest_support":    nearest_support,
+        "nearest_resistance": nearest_r,
+        "nearest_support":    nearest_s,
         "bnr_bull":           bnr_bull,
         "bnr_bear":           bnr_bear,
     }
@@ -253,39 +283,36 @@ def detect_fvg(df, lookback=30):
         c1 = recent.iloc[i]
         c3 = recent.iloc[i + 2]
 
-        if c3["low"] > c1["high"]:
-            if price > c1["high"]:
-                bullish_fvgs.append({
-                    "date":     str(recent.iloc[i + 1]["time"])[:10],
-                    "gap_high": round(float(c3["low"]), 5),
-                    "gap_low":  round(float(c1["high"]), 5),
-                })
+        if c3["low"] > c1["high"] and price > c1["high"]:
+            bullish_fvgs.append({
+                "date":     str(recent.iloc[i + 1]["time"])[:10],
+                "gap_high": round(float(c3["low"]), 5),
+                "gap_low":  round(float(c1["high"]), 5),
+            })
+        if c3["high"] < c1["low"] and price < c1["low"]:
+            bearish_fvgs.append({
+                "date":     str(recent.iloc[i + 1]["time"])[:10],
+                "gap_high": round(float(c1["low"]), 5),
+                "gap_low":  round(float(c3["high"]), 5),
+            })
 
-        if c3["high"] < c1["low"]:
-            if price < c1["low"]:
-                bearish_fvgs.append({
-                    "date":     str(recent.iloc[i + 1]["time"])[:10],
-                    "gap_high": round(float(c1["low"]), 5),
-                    "gap_low":  round(float(c3["high"]), 5),
-                })
+    nearest_bull = bullish_fvgs[-1] if bullish_fvgs else None
+    nearest_bear = bearish_fvgs[-1] if bearish_fvgs else None
 
-    nearest_bullish = bullish_fvgs[-1] if bullish_fvgs else None
-    nearest_bearish = bearish_fvgs[-1] if bearish_fvgs else None
-
-    bullish_active = (
-        nearest_bullish is not None and
-        nearest_bullish["gap_low"] - 0.5 * atr <= price <= nearest_bullish["gap_high"] + 0.5 * atr
+    bull_active = (
+        nearest_bull is not None and
+        nearest_bull["gap_low"] - 0.5*atr <= price <= nearest_bull["gap_high"] + 0.5*atr
     )
-    bearish_active = (
-        nearest_bearish is not None and
-        nearest_bearish["gap_low"] - 0.5 * atr <= price <= nearest_bearish["gap_high"] + 0.5 * atr
+    bear_active = (
+        nearest_bear is not None and
+        nearest_bear["gap_low"] - 0.5*atr <= price <= nearest_bear["gap_high"] + 0.5*atr
     )
 
     return {
-        "bullish_fvg":    nearest_bullish,
-        "bearish_fvg":    nearest_bearish,
-        "bullish_active": bullish_active,
-        "bearish_active": bearish_active,
+        "bullish_fvg":    nearest_bull,
+        "bearish_fvg":    nearest_bear,
+        "bullish_active": bull_active,
+        "bearish_active": bear_active,
     }
 
 
@@ -312,19 +339,21 @@ def fetch_economic_events():
 
 
 # ─── SCORECARD ───────────────────────────────────────────────────────────────
-def build_scorecard(df, lt_trend, st_trend, levels, fib, fvg):
+def build_scorecard(df, lt_trend, st_trend, h4_conf, h4_detail,
+                    h4_ema50, h4_rsi, levels, fib, fvg):
     """
-    Scoring weights:
-      Long-term trend        : 3 pts  (SIDEWAYS = 0)
-      Short-term trend       : 2 pts  (NEUTRAL  = 0)
-      Price vs 50 EMA        : 2 pts
-      50 EMA vs 200 EMA      : 2 pts
-      Break-and-retest       : 3 pts  (strongest signal — structure + momentum)
-      FVG active             : 2 pts
-      Fib 0.618 confluence   : 2 pts
-      Fib 0.500 confluence   : 1 pt
-      RSI                    : 1 pt
-      ATR                    : info only
+    Scoring:
+      Long-term trend    : 3 pts  (SIDEWAYS = 0)
+      Short-term trend   : 2 pts  (NEUTRAL  = 0)
+      Price vs 50 EMA    : 2 pts
+      50 EMA vs 200 EMA  : 2 pts
+      4H confirmation    : 2 pts  (NEUTRAL  = 0)
+      Break-and-retest   : 3 pts
+      FVG active         : 2 pts
+      Fib 0.618          : 2 pts  (confluence bonus)
+      Fib 0.500          : 1 pt   (confluence bonus)
+      RSI                : 1 pt
+      ATR                : info only
 
     CONFIRMED >= 8 | WATCH 5-7 | NO TRADE < 5
     """
@@ -360,13 +389,12 @@ def build_scorecard(df, lt_trend, st_trend, levels, fib, fvg):
     bear_score = 0
 
     # ── TREND ──────────────────────────────────────────────────────────────
-
     lt_icon = {"BULLISH": "📈", "BEARISH": "📉", "SIDEWAYS": "➡️"}.get(lt_trend, "➡️")
     if lt_trend == "BULLISH":
-        rows.append(("✅", f"Long-Term {ema200_dir}", f"{lt_icon} BULLISH", "Ideal: price > rising 200 EMA"))
+        rows.append(("✅", f"Long-Term {ema200_dir}", f"{lt_icon} BULLISH", "Price > rising 200 EMA"))
         bull_score += 3
     elif lt_trend == "BEARISH":
-        rows.append(("❌", f"Long-Term {ema200_dir}", f"{lt_icon} BEARISH", "Ideal: price < falling 200 EMA"))
+        rows.append(("❌", f"Long-Term {ema200_dir}", f"{lt_icon} BEARISH", "Price < falling 200 EMA"))
         bear_score += 3
     else:
         rows.append(("⚠️ ", f"Long-Term {ema200_dir}", f"{lt_icon} SIDEWAYS", "Range market — BNR entries preferred"))
@@ -381,8 +409,20 @@ def build_scorecard(df, lt_trend, st_trend, levels, fib, fvg):
     else:
         rows.append(("⚠️ ", f"Short-Term {ema20_dir}", f"{st_icon} NEUTRAL", f"20 EMA: {round(ema20,5)}  No clear direction"))
 
-    # ── PRICE & EMAS ───────────────────────────────────────────────────────
+    # ── 4H CONFIRMATION ────────────────────────────────────────────────────
+    rows.append(("──", "SEP", "", ""))
 
+    h4_icon = {"BULL": "📈", "BEAR": "📉", "NEUTRAL": "➡️"}.get(h4_conf, "➡️")
+    if h4_conf == "BULL":
+        rows.append(("✅", "4H Confirmation", f"{h4_icon} BULLISH", h4_detail))
+        bull_score += 2
+    elif h4_conf == "BEAR":
+        rows.append(("❌", "4H Confirmation", f"{h4_icon} BEARISH", h4_detail))
+        bear_score += 2
+    else:
+        rows.append(("⚠️ ", "4H Confirmation", f"{h4_icon} NEUTRAL", h4_detail))
+
+    # ── PRICE & EMAS ───────────────────────────────────────────────────────
     rows.append(("──", "SEP", "", ""))
 
     price_change = round(price - prev_close, 5)
@@ -421,8 +461,7 @@ def build_scorecard(df, lt_trend, st_trend, levels, fib, fvg):
     atr_note = "Expanding — wider stops" if atr > prev_atr else "Contracting — tighter stops"
     rows.append(("ℹ️ ", f"ATR (14) {atr_dir}", str(round(atr, 5)), atr_note))
 
-    # ── KEY LEVELS & BREAK-AND-RETEST ──────────────────────────────────────
-
+    # ── KEY LEVELS & BNR ───────────────────────────────────────────────────
     rows.append(("──", "SEP", "", ""))
 
     nr = levels["nearest_resistance"]
@@ -431,16 +470,15 @@ def build_scorecard(df, lt_trend, st_trend, levels, fib, fvg):
     rows.append(("  ", "Nearest Support",    str(ns) if ns else "None", "Watch for bounce or break"))
 
     if levels["bnr_bull"]:
-        rows.append(("✅", "Break & Retest", f"BULLISH at {levels['bnr_bull']}", "Broken resistance now support — high conviction entry"))
+        rows.append(("✅", "Break & Retest", f"BULLISH at {levels['bnr_bull']}", "Broken resistance = new support — high conviction"))
         bull_score += 3
     elif levels["bnr_bear"]:
-        rows.append(("❌", "Break & Retest", f"BEARISH at {levels['bnr_bear']}", "Broken support now resistance — high conviction entry"))
+        rows.append(("❌", "Break & Retest", f"BEARISH at {levels['bnr_bear']}", "Broken support = new resistance — high conviction"))
         bear_score += 3
     else:
         rows.append(("—", "Break & Retest", "None active", "No confirmed BNR setup"))
 
     # ── FVG ────────────────────────────────────────────────────────────────
-
     rows.append(("──", "SEP", "", ""))
 
     if fvg["bullish_active"]:
@@ -461,7 +499,6 @@ def build_scorecard(df, lt_trend, st_trend, levels, fib, fvg):
         rows.append(("—", "Fair Value Gap", "None detected", ""))
 
     # ── FIBONACCI ──────────────────────────────────────────────────────────
-
     rows.append(("──", "SEP", "", ""))
 
     if fib["near_fib618"]:
@@ -485,35 +522,46 @@ def build_scorecard(df, lt_trend, st_trend, levels, fib, fvg):
 
 
 # ─── SIGNAL ENGINE ───────────────────────────────────────────────────────────
-def generate_signal(df, events):
+def generate_signal(df, df_4h, events):
     latest = df.iloc[-1]
     price  = latest["close"]
     ema50  = latest["ema50"]
     atr    = latest["atr"]
 
-    lt_trend, lt_detail = classify_long_term_trend(df)
-    st_trend, st_detail = classify_short_term_trend(df)
-    levels              = detect_key_levels_and_bnr(df)
-    fib                 = calculate_fibonacci(df)
-    fvg                 = detect_fvg(df)
+    lt_trend, lt_detail         = classify_long_term_trend(df)
+    st_trend, st_detail         = classify_short_term_trend(df)
+    h4_conf, h4_detail, h4_ema50, h4_rsi = get_4h_confirmation(df_4h)
+    levels                      = detect_key_levels_and_bnr(df)
+    fib                         = calculate_fibonacci(df)
+    fvg                         = detect_fvg(df)
     scorecard, bull_score, bear_score = build_scorecard(
-        df, lt_trend, st_trend, levels, fib, fvg
+        df, lt_trend, st_trend, h4_conf, h4_detail,
+        h4_ema50, h4_rsi, levels, fib, fvg
     )
 
     news_today = len(events) > 0
 
+    # 4H must not contradict the daily signal
     if bull_score >= 8:
-        raw        = "CONFIRMED BUY"
-        raw_detail = f"Score {bull_score}/10 — Strong confluence. Limit order at 50 EMA ({round(ema50,5)})."
+        if h4_conf == "BEAR":
+            raw        = "WATCH — BUY BIAS (4H CONTRADICTS)"
+            raw_detail = f"Daily score {bull_score}/10 but 4H is bearish. Wait for 4H to align."
+        else:
+            raw        = "CONFIRMED BUY"
+            raw_detail = f"Score {bull_score}/10 — Daily + 4H aligned. Limit at 50 EMA ({round(ema50,5)})."
     elif bear_score >= 8:
-        raw        = "CONFIRMED SELL"
-        raw_detail = f"Score {bear_score}/10 — Strong confluence. Limit order at 50 EMA ({round(ema50,5)})."
+        if h4_conf == "BULL":
+            raw        = "WATCH — SELL BIAS (4H CONTRADICTS)"
+            raw_detail = f"Daily score {bear_score}/10 but 4H is bullish. Wait for 4H to align."
+        else:
+            raw        = "CONFIRMED SELL"
+            raw_detail = f"Score {bear_score}/10 — Daily + 4H aligned. Limit at 50 EMA ({round(ema50,5)})."
     elif bull_score >= 5:
         raw        = "WATCH — BUY SETUP FORMING"
-        raw_detail = f"Score {bull_score}/10 — Not enough confluence yet. Wait for score to reach 8."
+        raw_detail = f"Score {bull_score}/10 — Not enough confluence yet. Monitor."
     elif bear_score >= 5:
         raw        = "WATCH — SELL SETUP FORMING"
-        raw_detail = f"Score {bear_score}/10 — Not enough confluence yet. Wait for score to reach 8."
+        raw_detail = f"Score {bear_score}/10 — Not enough confluence yet. Monitor."
     else:
         raw        = "NO TRADE"
         raw_detail = f"Bull {bull_score}/10  Bear {bear_score}/10 — No edge. Stay out."
@@ -543,6 +591,7 @@ def generate_signal(df, events):
         "target_sell":   round(price - 3.0 * atr, 5),
         "lt_trend":      lt_trend,
         "st_trend":      st_trend,
+        "h4_conf":       h4_conf,
         "scorecard":     scorecard,
         "news_warning":  news_today,
         "events":        [e.get("event", "Unknown") for e in events],
@@ -622,16 +671,16 @@ RISK LEVELS  (CONFIRMED signals only)
 ------------------------------------------------------------
 SCORING GUIDE
 ------------------------------------------------------------
-  🟢 CONFIRMED  8+/10  Execute — strong confluence
+  🟢 CONFIRMED  8+/10  Execute — daily + 4H aligned
   🟡 WATCH      5-7    Setup forming — do not enter yet
   ⚪ NO TRADE   0-4    No edge — stay out
   ⛔ STAND DOWN        News day — wait regardless of score
 
-  Break-and-Retest adds 3pts — highest single signal weight
+  4H confirmation required — daily score alone is not enough
   BNR + FVG + Fib confluence = maximum conviction entry
 
 ------------------------------------------------------------
-GBP/USD Trading System v1.5"""
+GBP/USD Trading System v1.6"""
 
     subject = f"GBP/USD: {action_emoji} {data['action']} | Bull {data['bull_score']}/10  Bear {data['bear_score']}/10 | {ny_date}"
 
@@ -658,17 +707,24 @@ def run_signal_job():
     print(f"Running signal job at {datetime.now(timezone.utc)} UTC")
     print(f"{'='*40}")
     try:
-        print("Fetching candles...")
-        df = fetch_candles()
-        print("Calculating indicators...")
+        print("Fetching daily candles...")
+        df = fetch_candles(granularity="D", count=250)
         df = calculate_indicators(df)
+
+        print("Fetching 4H candles...")
+        df_4h = fetch_candles(granularity="H4", count=300)
+        df_4h = calculate_indicators(df_4h)
+
         print("Fetching economic calendar...")
         events = fetch_economic_events()
+
         print("Generating signal...")
-        signal_data = generate_signal(df, events)
-        print(f"Action: {signal_data['action']} | Bull: {signal_data['bull_score']} Bear: {signal_data['bear_score']}")
+        signal_data = generate_signal(df, df_4h, events)
+        print(f"Action: {signal_data['action']} | Bull: {signal_data['bull_score']} Bear: {signal_data['bear_score']} | 4H: {signal_data['h4_conf']}")
+
         print("Sending email...")
         build_and_send_email(signal_data)
+
     except Exception as e:
         print(f"Error: {e}")
 
