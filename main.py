@@ -1,6 +1,6 @@
 import os
 import time
-import smtplib
+send_email
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
