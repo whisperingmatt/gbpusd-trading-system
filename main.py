@@ -1,6 +1,5 @@
 import os
 import time
-send_email
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
@@ -239,11 +238,19 @@ GBP/USD Trading System v1.0
 
 # ─── EMAIL SENDER ─────────────────────────────────────────────────────────────
 def send_email(msg):
-    with smtplib.SMTP("smtp.gmail.com", 587) as server:
-        server.ehlo()
-        server.starttls()
-        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-        server.sendmail(EMAIL_SENDER, EMAIL_RECIPIENT, msg.as_string())
+    url = "https://api.sendgrid.com/v3/mail/send"
+    headers = {
+        "Authorization": f"Bearer {os.getenv('SENDGRID_API_KEY')}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "personalizations": [{"to": [{"email": EMAIL_RECIPIENT}]}],
+        "from": {"email": EMAIL_SENDER},
+        "subject": msg["Subject"],
+        "content": [{"type": "text/plain", "value": msg.get_payload()}]
+    }
+    response = requests.post(url, headers=headers, json=payload)
+    response.raise_for_status()
     print(f"✅ Email sent at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 # ─── MAIN JOB ─────────────────────────────────────────────────────────────────
