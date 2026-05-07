@@ -2,7 +2,7 @@ import os
 import time
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 import schedule
 import pytz
@@ -13,10 +13,10 @@ load_dotenv()
 OANDA_API_KEY    = os.getenv("OANDA_API_KEY")
 OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
 OANDA_ENV        = os.getenv("OANDA_ENV", "practice")
-FINNHUB_API_KEY  = os.getenv("FINNHUB_API_KEY")
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
 EMAIL_SENDER     = os.getenv("EMAIL_SENDER")
-EMAIL_PASSWORD   = os.getenv("EMAIL_PASSWORD")
 EMAIL_RECIPIENT  = os.getenv("EMAIL_RECIPIENT")
+FINNHUB_API_KEY  = os.getenv("FINNHUB_API_KEY")
 
 OANDA_BASE = (
     "https://api-fxpractice.oanda.com/v3"
@@ -26,18 +26,18 @@ OANDA_BASE = (
 
 INSTRUMENT = "GBP_USD"
 
-# ─── OANDA: FETCH DAILY CANDLES ───────────────────────────────────────────────
+
+# ─── OANDA: FETCH DAILY CANDLES ──────────────────────────────────────────────
 def fetch_candles(count=250):
-    url = f"{OANDA_BASE}/instruments/{INSTRUMENT}/candles"
+    url     = f"{OANDA_BASE}/instruments/{INSTRUMENT}/candles"
     headers = {"Authorization": f"Bearer {OANDA_API_KEY}"}
     params  = {"granularity": "D", "count": count, "price": "M"}
 
     response = requests.get(url, headers=headers, params=params)
     response.raise_for_status()
-    candles = response.json()["candles"]
 
     rows = []
-    for c in candles:
+    for c in response.json()["candles"]:
         if c["complete"]:
             rows.append({
                 "time":   c["time"][:10],
@@ -53,22 +53,20 @@ def fetch_candles(count=250):
     df.set_index("time", inplace=True)
     return df
 
-# ─── TECHNICAL INDICATORS ─────────────────────────────────────────────────────
+
+# ─── TECHNICAL INDICATORS ────────────────────────────────────────────────────
 def calculate_indicators(df):
-    # EMAs
     df["ema50"]  = df["close"].ewm(span=50,  adjust=False).mean()
     df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
 
-    # RSI (14)
-    delta = df["close"].diff()
-    gain  = delta.clip(lower=0)
-    loss  = -delta.clip(upper=0)
+    delta    = df["close"].diff()
+    gain     = delta.clip(lower=0)
+    loss     = -delta.clip(upper=0)
     avg_gain = gain.ewm(com=13, adjust=False).mean()
     avg_loss = loss.ewm(com=13, adjust=False).mean()
-    rs = avg_gain / avg_loss
+    rs       = avg_gain / avg_loss
     df["rsi"] = 100 - (100 / (1 + rs))
 
-    # ATR (14)
     df["tr"] = pd.concat([
         df["high"] - df["low"],
         (df["high"] - df["close"].shift()).abs(),
@@ -78,11 +76,12 @@ def calculate_indicators(df):
 
     return df
 
-# ─── ECONOMIC CALENDAR ────────────────────────────────────────────────────────
+
+# ─── ECONOMIC CALENDAR ───────────────────────────────────────────────────────
 def fetch_economic_events():
-    today     = datetime.utcnow().strftime("%Y-%m-%d")
-    tomorrow  = (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%d")
-    url = (
+    today    = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")
+    url      = (
         f"https://finnhub.io/api/v1/calendar/economic"
         f"?from={today}&to={tomorrow}&token={FINNHUB_API_KEY}"
     )
@@ -90,62 +89,46 @@ def fetch_economic_events():
         response = requests.get(url, timeout=10)
         response.raise_for_status()
         events = response.json().get("economicCalendar", [])
-        high_impact = [
+        return [
             e for e in events
             if e.get("impact") == "high"
             and e.get("country") in ("US", "GB")
         ]
-        return high_impact
     except Exception as e:
         print(f"Calendar fetch error: {e}")
         return []
 
-# ─── SIGNAL ENGINE ────────────────────────────────────────────────────────────
+
+# ─── SIGNAL ENGINE ───────────────────────────────────────────────────────────
 def generate_signal(df, events):
     latest   = df.iloc[-1]
     previous = df.iloc[-2]
 
-    price   = latest["close"]
-    ema50   = latest["ema50"]
-    ema200  = latest["ema200"]
-    rsi     = latest["rsi"]
-    atr     = latest["atr"]
+    price  = latest["close"]
+    ema50  = latest["ema50"]
+    ema200 = latest["ema200"]
+    rsi    = latest["rsi"]
+    atr    = latest["atr"]
 
-    # News warning
-    news_warning = len(events) > 0
-    event_names  = [e.get("event", "Unknown event") for e in events]
+    bullish_trend  = price > ema50 > ema200
+    bearish_trend  = price < ema50 < ema200
+    rsi_overbought = rsi > 70
+    rsi_oversold   = rsi < 30
+    rsi_neutral    = 40 <= rsi <= 60
+    near_ema50     = abs(price - ema50) / atr < 0.5
 
-    # Trend structure
-    bullish_trend = price > ema50 > ema200
-    bearish_trend = price < ema50 < ema200
-
-    # RSI conditions
-    rsi_neutral     = 40 <= rsi <= 60
-    rsi_overbought  = rsi > 70
-    rsi_oversold    = rsi < 30
-
-    # Pullback to EMA50 (entry trigger)
-    near_ema50 = abs(price - ema50) / atr < 0.5
-
-    # Determine signal
-    if bullish_trend and (rsi_neutral or rsi_oversold) and not rsi_overbought:
+    if bullish_trend and not rsi_overbought:
         if near_ema50 or previous["close"] < previous["ema50"]:
             signal = "BUY"
         else:
             signal = "BUY BIAS — Wait for pullback to 50 EMA"
-    elif bearish_trend and (rsi_neutral or rsi_overbought) and not rsi_oversold:
+    elif bearish_trend and not rsi_oversold:
         if near_ema50 or previous["close"] > previous["ema50"]:
             signal = "SELL"
         else:
             signal = "SELL BIAS — Wait for rally to 50 EMA"
     else:
         signal = "NO SIGNAL — Mixed conditions"
-
-    # Risk levels
-    stop_buy    = round(price - (1.5 * atr), 5)
-    target_buy  = round(price + (3.0 * atr), 5)
-    stop_sell   = round(price + (1.5 * atr), 5)
-    target_sell = round(price - (3.0 * atr), 5)
 
     return {
         "signal":       signal,
@@ -154,35 +137,36 @@ def generate_signal(df, events):
         "ema200":       round(ema200, 5),
         "rsi":          round(rsi, 2),
         "atr":          round(atr, 5),
-        "stop_buy":     stop_buy,
-        "target_buy":   target_buy,
-        "stop_sell":    stop_sell,
-        "target_sell":  target_sell,
-        "news_warning": news_warning,
-        "events":       event_names,
+        "stop_buy":     round(price - 1.5 * atr, 5),
+        "target_buy":   round(price + 3.0 * atr, 5),
+        "stop_sell":    round(price + 1.5 * atr, 5),
+        "target_sell":  round(price - 3.0 * atr, 5),
+        "news_warning": len(events) > 0,
+        "events":       [e.get("event", "Unknown") for e in events],
     }
 
-# ─── EMAIL BUILDER ────────────────────────────────────────────────────────────
-def build_email(data):
-    ny_time = datetime.now(pytz.timezone("America/New_York")).strftime("%A %d %B %Y – %I:%M %p EST")
 
-    signal_emoji = {"BUY": "🟢", "SELL": "🔴"}
-    emoji = next((v for k, v in signal_emoji.items() if k in data["signal"]), "🟡")
+# ─── EMAIL ───────────────────────────────────────────────────────────────────
+def build_and_send_email(data):
+    ny_tz   = pytz.timezone("America/New_York")
+    ny_time = datetime.now(ny_tz).strftime("%A %d %B %Y – %I:%M %p EST")
+    ny_date = datetime.now(ny_tz).strftime("%d %b %Y")
+
+    emoji = "🟢" if "BUY" in data["signal"] else "🔴" if "SELL" in data["signal"] else "🟡"
 
     news_block = ""
     if data["news_warning"]:
-        events_list = "\n".join(f"  ⚠️  {e}" for e in data["events"])
+        event_lines = "\n".join(f"  ⚠️  {e}" for e in data["events"])
         news_block = f"""
 ────────────────────────────
 HIGH IMPACT NEWS – CAUTION
 ────────────────────────────
-{events_list}
+{event_lines}
 
-⚠️  Consider waiting for post-news price to settle before entering.
+⚠️  Wait for post-news price to settle before entering.
 """
 
-    body = f"""
-GBP/USD DAILY SIGNAL REPORT
+    body = f"""GBP/USD DAILY SIGNAL REPORT
 {ny_time}
 ════════════════════════════
 
@@ -218,39 +202,35 @@ REMINDERS
 ✅  Max 1-2% risk per trade
 ✅  Confirm entry on TradingView before executing
 ✅  Check Forex Factory for any missed events
-✅  No trade without confirmed signal
+✅  No trade without a confirmed signal
 
 ────────────────────────────
-GBP/USD Trading System v1.0
-    """
+GBP/USD Trading System v1.0"""
 
-    return {
-        "subject": f"GBP/USD Signal: {emoji} {data['signal']} | {datetime.now(pytz.timezone('America/New_York')).strftime('%d %b %Y')}",
-        "body": body
-    }
-# ─── EMAIL SENDER ─────────────────────────────────────────────────────────────
-def send_email(msg):
-    url = "https://api.sendgrid.com/v3/mail/send"
-    headers = {
-        "Authorization": f"Bearer {os.getenv('SENDGRID_API_KEY')}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "personalizations": [{"to": [{"email": EMAIL_RECIPIENT}]}],
-        "from": {"email": EMAIL_SENDER},
-        "subject": msg["subject"],
-        "content": [{"type": "text/plain", "value": msg["body"]()}]
-    }
-    response = requests.post(url, headers=headers, json=payload)
+    subject = f"GBP/USD Signal: {emoji} {data['signal']} | {ny_date}"
+
+    response = requests.post(
+        "https://api.sendgrid.com/v3/mail/send",
+        headers={
+            "Authorization": f"Bearer {SENDGRID_API_KEY}",
+            "Content-Type":  "application/json",
+        },
+        json={
+            "personalizations": [{"to": [{"email": EMAIL_RECIPIENT}]}],
+            "from":    {"email": EMAIL_SENDER},
+            "subject": subject,
+            "content": [{"type": "text/plain", "value": body}],
+        }
+    )
     response.raise_for_status()
     print(f"✅ Email sent at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-# ─── MAIN JOB ─────────────────────────────────────────────────────────────────
+
+# ─── MAIN JOB ────────────────────────────────────────────────────────────────
 def run_signal_job():
     print(f"\n{'='*40}")
-    print(f"Running signal job at {datetime.utcnow()} UTC")
+    print(f"Running signal job at {datetime.now(timezone.utc)} UTC")
     print(f"{'='*40}")
-
     try:
         print("Fetching candles from OANDA...")
         df = fetch_candles()
@@ -266,21 +246,19 @@ def run_signal_job():
         print(f"Signal: {signal_data['signal']}")
 
         print("Sending email...")
-        email = build_email(signal_data)
-        send_email(email)
+        build_and_send_email(signal_data)
 
     except Exception as e:
         print(f"❌ Error: {e}")
 
-# ─── SCHEDULER ────────────────────────────────────────────────────────────────
+
+# ─── SCHEDULER ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("GBP/USD Signal System starting...")
     print("Scheduled daily at 5:00 PM EST (New York close)")
 
-    # Run immediately on startup so you can test it
     run_signal_job()
 
-    # Then schedule daily at 17:00 EST
     schedule.every().day.at("22:00").do(run_signal_job)  # 22:00 UTC = 17:00 EST
 
     while True:
