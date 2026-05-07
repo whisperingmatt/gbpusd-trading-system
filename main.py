@@ -1,4 +1,4 @@
-pythonimport os
+import os
 import time
 import smtplib
 import requests
