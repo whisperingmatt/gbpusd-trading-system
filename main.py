@@ -1,6 +1,7 @@
 import os
 import time
 import requests
+import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
@@ -11,7 +12,6 @@ load_dotenv()
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 OANDA_API_KEY    = os.getenv("OANDA_API_KEY")
-OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
 OANDA_ENV        = os.getenv("OANDA_ENV", "practice")
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
 EMAIL_SENDER     = os.getenv("EMAIL_SENDER")
@@ -24,20 +24,50 @@ OANDA_BASE = (
     else "https://api-fxtrade.oanda.com/v3"
 )
 
-INSTRUMENT = "GBP_USD"
+# Risk settings
+RISK_PER_TRADE   = 2000.00   # USD per trade
+LOT_SIZE         = 100_000   # standard lot
+
+# Strategy thresholds
+ADX_TREND_MIN    = 25        # ADX above this = trending
+ADX_RANGE_MAX    = 20        # ADX below this = ranging
+RSI_BUY_MAX      = 58        # RSI upper limit for trend buy entry
+RSI_BUY_MIN      = 38        # RSI lower limit for trend buy entry
+RSI_SELL_MAX     = 62        # RSI upper limit for trend sell entry
+RSI_SELL_MIN     = 42        # RSI lower limit for trend sell entry
+RSI_OVERSOLD     = 32        # RSI for mean reversion buy
+RSI_OVERBOUGHT   = 68        # RSI for mean reversion sell
+ATR_ENTRY_MULT   = 0.5       # price must be within this × ATR of 50 EMA
+ATR_STOP_MULT    = 1.5       # stop distance
+RANGE_LOOKBACK   = 30        # candles to define range for Strategy B
+
+# Central bank rates (update after each meeting)
+RATES = {
+    "GBP": 3.75,
+    "USD": 3.625,
+    "EUR": 2.50,
+    "AUD": 4.10,
+    "JPY": 0.50,
+}
+
+# Pairs config: instrument, base currency, quote currency, commodity, commodity relationship
+PAIRS = {
+    "GBP_USD": {"base": "GBP", "quote": "USD", "pip": 0.0001, "commodity": "XAU_USD",  "comm_label": "Gold"},
+    "EUR_USD": {"base": "EUR", "quote": "USD", "pip": 0.0001, "commodity": "XAU_USD",  "comm_label": "Gold"},
+    "AUD_USD": {"base": "AUD", "quote": "USD", "pip": 0.0001, "commodity": "XAU_USD",  "comm_label": "Gold"},
+    "USD_JPY": {"base": "USD", "quote": "JPY", "pip": 0.01,   "commodity": "WTICO_USD","comm_label": "Oil"},
+}
 
 
-# ─── FETCH CANDLES (reusable for any granularity) ────────────────────────────
-def fetch_candles(granularity="D", count=250):
-    url     = f"{OANDA_BASE}/instruments/{INSTRUMENT}/candles"
+# ─── DATA FETCHING ───────────────────────────────────────────────────────────
+def fetch_candles(instrument, granularity="D", count=250):
+    url     = f"{OANDA_BASE}/instruments/{instrument}/candles"
     headers = {"Authorization": f"Bearer {OANDA_API_KEY}"}
     params  = {"granularity": granularity, "count": count, "price": "M"}
-
-    response = requests.get(url, headers=headers, params=params)
-    response.raise_for_status()
-
+    r = requests.get(url, headers=headers, params=params)
+    r.raise_for_status()
     rows = []
-    for c in response.json()["candles"]:
+    for c in r.json()["candles"]:
         if c["complete"]:
             rows.append({
                 "time":   c["time"][:19],
@@ -45,9 +75,7 @@ def fetch_candles(granularity="D", count=250):
                 "high":   float(c["mid"]["h"]),
                 "low":    float(c["mid"]["l"]),
                 "close":  float(c["mid"]["c"]),
-                "volume": int(c["volume"]),
             })
-
     df = pd.DataFrame(rows)
     df["time"] = pd.to_datetime(df["time"])
     df.set_index("time", inplace=True)
@@ -56,264 +84,300 @@ def fetch_candles(granularity="D", count=250):
 
 # ─── INDICATORS ──────────────────────────────────────────────────────────────
 def calculate_indicators(df):
+    # EMAs
     df["ema20"]  = df["close"].ewm(span=20,  adjust=False).mean()
     df["ema50"]  = df["close"].ewm(span=50,  adjust=False).mean()
     df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
 
+    # RSI
     delta    = df["close"].diff()
     gain     = delta.clip(lower=0)
     loss     = -delta.clip(upper=0)
-    avg_gain = gain.ewm(com=13, adjust=False).mean()
-    avg_loss = loss.ewm(com=13, adjust=False).mean()
-    rs        = avg_gain / avg_loss
-    df["rsi"] = 100 - (100 / (1 + rs))
+    df["rsi"] = 100 - (100 / (1 + gain.ewm(com=13, adjust=False).mean() /
+                                   loss.ewm(com=13, adjust=False).mean()))
 
+    # ATR
+    prev_close = df["close"].shift(1)
     df["tr"] = pd.concat([
         df["high"] - df["low"],
-        (df["high"] - df["close"].shift()).abs(),
-        (df["low"]  - df["close"].shift()).abs()
+        (df["high"] - prev_close).abs(),
+        (df["low"]  - prev_close).abs()
     ], axis=1).max(axis=1)
     df["atr"] = df["tr"].ewm(com=13, adjust=False).mean()
+
+    # ADX (Wilder's method)
+    up_move   = df["high"] - df["high"].shift(1)
+    down_move = df["low"].shift(1) - df["low"]
+    pos_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    neg_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    tr_s   = df["tr"].ewm(com=13, adjust=False).mean()
+    pdm_s  = pd.Series(pos_dm, index=df.index).ewm(com=13, adjust=False).mean()
+    ndm_s  = pd.Series(neg_dm, index=df.index).ewm(com=13, adjust=False).mean()
+
+    df["pdi"] = 100 * pdm_s / tr_s
+    df["ndi"] = 100 * ndm_s / tr_s
+    dx        = 100 * (df["pdi"] - df["ndi"]).abs() / (df["pdi"] + df["ndi"])
+    df["adx"] = dx.ewm(com=13, adjust=False).mean()
 
     return df
 
 
+# ─── TIME FILTER ─────────────────────────────────────────────────────────────
+def time_filter():
+    """
+    Returns (can_trade, size_modifier, reason).
+    """
+    now   = datetime.now(pytz.timezone("America/New_York"))
+    month = now.month
+    day   = now.day
+    wday  = now.weekday()  # 0=Mon, 4=Fri
+
+    # Never trade
+    if wday == 4:
+        return False, 0.0, "Friday — no trades"
+    if month == 12 and day >= 18:
+        return False, 0.0, "Year-end thin markets"
+    if month == 1 and day <= 5:
+        return False, 0.0, "New year thin markets"
+
+    # Reduced size
+    if month == 8:
+        return True, 0.5, "August — reduced size (thin markets)"
+
+    return True, 1.0, ""
+
+
+# ─── REGIME DETECTION ────────────────────────────────────────────────────────
+def classify_regime(df):
+    """
+    TRENDING / RANGING / AMBIGUOUS based on ADX and EMA structure.
+    Returns (regime, adx_value, direction_hint).
+    """
+    adx   = df["adx"].iloc[-1]
+    pdi   = df["pdi"].iloc[-1]
+    ndi   = df["ndi"].iloc[-1]
+    e50   = df["ema50"].iloc[-1]
+    e200  = df["ema200"].iloc[-1]
+    price = df["close"].iloc[-1]
+
+    # ADX rising?
+    adx_rising = adx > df["adx"].iloc[-4]
+
+    if adx > ADX_TREND_MIN and adx_rising:
+        if pdi > ndi and e50 > e200:
+            return "TRENDING", adx, "BULLISH"
+        elif ndi > pdi and e50 < e200:
+            return "TRENDING", adx, "BEARISH"
+        else:
+            return "AMBIGUOUS", adx, "MIXED"
+    elif adx < ADX_RANGE_MAX:
+        return "RANGING", adx, "NEUTRAL"
+    else:
+        return "AMBIGUOUS", adx, "MIXED"
+
+
 # ─── 4H CONFIRMATION ─────────────────────────────────────────────────────────
-def get_4h_confirmation(df_4h):
+def get_4h_confirmation(df_4h, direction):
     """
-    Checks the most recent 4H candle for directional confirmation.
-    Returns: 'BULL', 'BEAR', or 'NEUTRAL' plus a detail string.
-
-    Rules (need 2 of 3 to confirm):
-      1. Price vs 4H 50 EMA
-      2. 4H 50 EMA vs 4H 200 EMA
-      3. 4H RSI in favourable zone
+    Hard blocker. Returns True if 4H agrees, False if it contradicts.
+    2 of 3 checks must pass.
     """
-    latest   = df_4h.iloc[-1]
-    previous = df_4h.iloc[-2]
+    l = df_4h.iloc[-1]
+    checks = 0
 
-    price    = latest["close"]
-    ema20_4h = latest["ema20"]
-    ema50_4h = latest["ema50"]
-    ema200_4h = latest["ema200"]
-    rsi_4h   = latest["rsi"]
-
-    ema20_dir = "▲" if ema20_4h > previous["ema20"] else "▼"
-    ema50_dir = "▲" if ema50_4h > previous["ema50"] else "▼"
-
-    bull_checks = 0
-    bear_checks = 0
-
-    # Check 1: Price vs 4H 50 EMA
-    if price > ema50_4h:
-        bull_checks += 1
+    if direction == "BUY":
+        if l["close"] > l["ema50"]:  checks += 1
+        if l["ema50"] > l["ema200"]: checks += 1
+        if 35 <= l["rsi"] <= 68:     checks += 1
+        if l["rsi"] < 35:            checks += 1  # oversold = buy confirmed
     else:
-        bear_checks += 1
+        if l["close"] < l["ema50"]:  checks += 1
+        if l["ema50"] < l["ema200"]: checks += 1
+        if 32 <= l["rsi"] <= 65:     checks += 1
+        if l["rsi"] > 65:            checks += 1  # overbought = sell confirmed
 
-    # Check 2: 4H 50 EMA vs 4H 200 EMA
-    if ema50_4h > ema200_4h:
-        bull_checks += 1
+    return checks >= 2, checks, round(l["rsi"], 1)
+
+
+# ─── COMMODITY ALIGNMENT ─────────────────────────────────────────────────────
+def get_commodity_alignment(comm_df, direction, pair):
+    """
+    Checks if commodity trend aligns with trade direction.
+    Returns (alignment, detail).
+    ALIGNED / CONTRARY / NEUTRAL
+    """
+    if comm_df is None or len(comm_df) < 52:
+        return "NEUTRAL", "No commodity data"
+
+    price  = comm_df["close"].iloc[-1]
+    ema50  = comm_df["ema50"].iloc[-1]
+    ema50_slope = (ema50 - comm_df["ema50"].iloc[-10]) / comm_df["ema50"].iloc[-10] * 100
+    comm_bullish = price > ema50 and ema50_slope > 0
+
+    # For all our pairs: rising commodity = bullish pair direction
+    # (gold = inverse USD = good for GBP/USD, EUR/USD, AUD/USD longs)
+    # (oil rising = JPY weakens = USD/JPY longs)
+    if direction == "BUY" and comm_bullish:
+        return "ALIGNED",  f"Above 50 EMA, slope +{round(ema50_slope,2)}%"
+    elif direction == "SELL" and not comm_bullish:
+        return "ALIGNED",  f"Below 50 EMA, slope {round(ema50_slope,2)}%"
+    elif direction == "BUY" and not comm_bullish:
+        return "CONTRARY", f"Below 50 EMA — headwind for longs"
+    elif direction == "SELL" and comm_bullish:
+        return "CONTRARY", f"Above 50 EMA — headwind for shorts"
+    return "NEUTRAL", "Flat"
+
+
+# ─── RATE DIFFERENTIAL ───────────────────────────────────────────────────────
+def get_rate_differential(pair):
+    """
+    Returns (differential, bias, detail).
+    Positive = base currency has rate advantage.
+    """
+    cfg   = PAIRS[pair]
+    base  = cfg["base"]
+    quote = cfg["quote"]
+    diff  = RATES.get(base, 0) - RATES.get(quote, 0)
+
+    if diff > 0.5:
+        bias   = "BULLISH"
+        detail = f"{base} rate {RATES[base]}% vs {quote} {RATES[quote]}% (+{round(diff,2)}%)"
+    elif diff < -0.5:
+        bias   = "BEARISH"
+        detail = f"{base} rate {RATES[base]}% vs {quote} {RATES[quote]}% ({round(diff,2)}%)"
     else:
-        bear_checks += 1
+        bias   = "NEUTRAL"
+        detail = f"Rate differential near zero ({round(diff,2)}%)"
 
-    # Check 3: 4H RSI
-    if 40 <= rsi_4h <= 65:
-        bull_checks += 1
-    elif rsi_4h < 35:
-        bull_checks += 1
-    elif rsi_4h > 68:
-        bear_checks += 1
+    return diff, bias, detail
 
-    if bull_checks >= 2:
-        direction = "BULL"
-        detail    = f"4H EMA {ema50_dir}: {round(ema50_4h,5)} | 4H RSI: {round(rsi_4h,1)} | {bull_checks}/3 bull checks"
-    elif bear_checks >= 2:
-        direction = "BEAR"
-        detail    = f"4H EMA {ema50_dir}: {round(ema50_4h,5)} | 4H RSI: {round(rsi_4h,1)} | {bear_checks}/3 bear checks"
+
+# ─── STRATEGY A: TREND FOLLOWING ─────────────────────────────────────────────
+def strategy_a_signal(df, df_4h):
+    """
+    Entry only when:
+    1. ADX > 25 and rising
+    2. Price touches 50 EMA (within ATR_ENTRY_MULT × ATR)
+    3. 50 EMA above/below 200 EMA
+    4. RSI in favourable zone at touch
+    5. Previous candle closed in trend direction
+    6. 4H confirms
+    """
+    l    = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    price = l["close"]
+    e50   = l["ema50"]
+    e200  = l["ema200"]
+    rsi   = l["rsi"]
+    atr   = l["atr"]
+    adx   = l["adx"]
+
+    near_ema50  = abs(price - e50) <= ATR_ENTRY_MULT * atr
+    adx_rising  = adx > df["adx"].iloc[-4]
+    bull_struct = e50 > e200 and price >= e50
+    bear_struct = e50 < e200 and price <= e50
+    prev_bull   = prev["close"] > prev["open"]
+    prev_bear   = prev["close"] < prev["open"]
+
+    if (adx > ADX_TREND_MIN and adx_rising and near_ema50
+            and bull_struct and RSI_BUY_MIN <= rsi <= RSI_BUY_MAX and prev_bull):
+        conf, checks, rsi_4h = get_4h_confirmation(df_4h, "BUY")
+        if conf:
+            return "BUY", checks, rsi_4h
+        return "BUY_NO4H", checks, rsi_4h
+
+    if (adx > ADX_TREND_MIN and adx_rising and near_ema50
+            and bear_struct and RSI_SELL_MIN <= rsi <= RSI_SELL_MAX and prev_bear):
+        conf, checks, rsi_4h = get_4h_confirmation(df_4h, "SELL")
+        if conf:
+            return "SELL", checks, rsi_4h
+        return "SELL_NO4H", checks, rsi_4h
+
+    # Bias without full entry
+    if adx > ADX_TREND_MIN and adx_rising and bull_struct:
+        return "BUY_BIAS", 0, round(l["rsi"], 1)
+    if adx > ADX_TREND_MIN and adx_rising and bear_struct:
+        return "SELL_BIAS", 0, round(l["rsi"], 1)
+
+    return "NO_SIGNAL", 0, round(rsi, 1)
+
+
+# ─── STRATEGY B: MEAN REVERSION ──────────────────────────────────────────────
+def strategy_b_signal(df, df_4h):
+    """
+    Entry only when:
+    1. ADX < 20
+    2. Price within 1x ATR of 30-candle range boundary
+    3. RSI extreme (< 32 for buy, > 68 for sell)
+    4. Reversal candle (closes in direction of trade)
+    5. 4H confirms
+    """
+    l    = df.iloc[-1]
+    recent = df.iloc[-RANGE_LOOKBACK:]
+
+    price        = l["close"]
+    rsi          = l["rsi"]
+    atr          = l["atr"]
+    range_high   = recent["high"].max()
+    range_low    = recent["low"].min()
+    range_mid    = (range_high + range_low) / 2
+    near_high    = abs(price - range_high) <= atr
+    near_low     = abs(price - range_low) <= atr
+    bull_candle  = l["close"] > l["open"]
+    bear_candle  = l["close"] < l["open"]
+
+    if near_low and rsi < RSI_OVERSOLD and bull_candle:
+        conf, checks, rsi_4h = get_4h_confirmation(df_4h, "BUY")
+        if conf:
+            return "BUY", checks, rsi_4h, range_high, range_low, range_mid
+        return "BUY_NO4H", checks, rsi_4h, range_high, range_low, range_mid
+
+    if near_high and rsi > RSI_OVERBOUGHT and bear_candle:
+        conf, checks, rsi_4h = get_4h_confirmation(df_4h, "SELL")
+        if conf:
+            return "SELL", checks, rsi_4h, range_high, range_low, range_mid
+        return "SELL_NO4H", checks, rsi_4h, range_high, range_low, range_mid
+
+    return "NO_SIGNAL", 0, round(rsi, 1), range_high, range_low, range_mid
+
+
+# ─── POSITION SIZING ─────────────────────────────────────────────────────────
+def calculate_position_size(atr, price, pair, size_modifier, comm_alignment, rate_bias, direction):
+    """
+    Volatility-adjusted position sizing.
+    Returns (lots, effective_risk, modifiers_applied).
+    """
+    stop_distance = ATR_STOP_MULT * atr
+    cfg           = PAIRS[pair]
+
+    # Dollar value of stop distance per lot
+    if cfg["quote"] == "USD":
+        stop_value_per_lot = stop_distance * LOT_SIZE
     else:
-        direction = "NEUTRAL"
-        detail    = f"4H EMA {ema50_dir}: {round(ema50_4h,5)} | 4H RSI: {round(rsi_4h,1)} | Mixed — no clear direction"
+        # USD is base (USD/JPY) — stop in JPY, convert to USD
+        stop_value_per_lot = (stop_distance / price) * LOT_SIZE
 
-    return direction, detail, round(ema50_4h,5), round(rsi_4h,1)
+    modifiers = []
+    modifier  = size_modifier
 
+    # Commodity contrary signal
+    if comm_alignment == "CONTRARY":
+        modifier *= 0.5
+        modifiers.append("50% — commodity headwind")
 
-# ─── LONG-TERM TREND (200 EMA) ───────────────────────────────────────────────
-def classify_long_term_trend(df):
-    price        = df.iloc[-1]["close"]
-    ema200_now   = df["ema200"].iloc[-1]
-    ema200_20ago = df["ema200"].iloc[-20]
-    ema200_50ago = df["ema200"].iloc[-50]
-    slope_20     = (ema200_now - ema200_20ago) / ema200_20ago * 100
-    slope_50     = (ema200_now - ema200_50ago) / ema200_50ago * 100
+    # Rate differential contrary
+    if (rate_bias == "BULLISH" and direction == "SELL") or \
+       (rate_bias == "BEARISH" and direction == "BUY"):
+        modifier *= 0.5
+        modifiers.append("50% — rate differential headwind")
 
-    high_200  = df["high"].iloc[-200:].max()
-    low_200   = df["low"].iloc[-200:].min()
-    range_200 = high_200 - low_200
-    range_mid = low_200 + range_200 * 0.5
-    range_pct = range_200 / ema200_now * 100
+    effective_risk = RISK_PER_TRADE * modifier
+    lots           = round(effective_risk / stop_value_per_lot, 2)
+    lots           = max(lots, 0.01)
 
-    is_wide   = range_pct > 8.0
-    is_flat   = abs(slope_50) < 0.3
-    in_upper  = price > range_mid
-
-    if is_wide and is_flat:
-        position = "upper half" if in_upper else "lower half"
-        return "SIDEWAYS", f"Channel {round(low_200,4)}-{round(high_200,4)} | In {position}"
-    elif price > ema200_now and slope_20 > 0.05 and slope_50 > 0.1:
-        return "BULLISH", "200 EMA rising | Price above"
-    elif price < ema200_now and slope_20 < -0.05 and slope_50 < -0.1:
-        return "BEARISH", "200 EMA falling | Price below"
-    elif is_wide and in_upper:
-        return "SIDEWAYS", f"Channel {round(low_200,4)}-{round(high_200,4)} | In upper half"
-    else:
-        return "SIDEWAYS", f"Channel {round(low_200,4)}-{round(high_200,4)} | In lower half"
-
-
-# ─── SHORT-TERM TREND (20 EMA) ───────────────────────────────────────────────
-def classify_short_term_trend(df):
-    price       = df.iloc[-1]["close"]
-    ema20_now   = df["ema20"].iloc[-1]
-    ema20_5ago  = df["ema20"].iloc[-5]
-    ema20_slope = (ema20_now - ema20_5ago) / ema20_5ago * 100
-
-    if price > ema20_now and ema20_slope > 0.02:
-        return "BULLISH", f"Price above rising 20 EMA ({round(ema20_now,5)})"
-    elif price < ema20_now and ema20_slope < -0.02:
-        return "BEARISH", f"Price below falling 20 EMA ({round(ema20_now,5)})"
-    else:
-        return "NEUTRAL", f"Price near 20 EMA ({round(ema20_now,5)}) — no clear direction"
-
-
-# ─── KEY LEVELS & BREAK-AND-RETEST ───────────────────────────────────────────
-def detect_key_levels_and_bnr(df, lookback=200, tolerance_atr=0.75):
-    price  = df.iloc[-1]["close"]
-    atr    = df.iloc[-1]["atr"]
-    tol    = tolerance_atr * atr
-    recent = df.iloc[-lookback:].reset_index()
-    window = 5
-
-    swing_highs = []
-    swing_lows  = []
-
-    for i in range(window, len(recent) - window):
-        hi = recent.iloc[i]["high"]
-        lo = recent.iloc[i]["low"]
-        if hi == recent.iloc[i-window:i+window+1]["high"].max():
-            swing_highs.append(round(hi, 5))
-        if lo == recent.iloc[i-window:i+window+1]["low"].min():
-            swing_lows.append(round(lo, 5))
-
-    def cluster(levels):
-        if not levels:
-            return []
-        levels = sorted(set(levels))
-        clustered = []
-        group = [levels[0]]
-        for lv in levels[1:]:
-            if lv - group[-1] <= 0.5 * atr:
-                group.append(lv)
-            else:
-                clustered.append(round(sum(group) / len(group), 5))
-                group = [lv]
-        clustered.append(round(sum(group) / len(group), 5))
-        return clustered
-
-    resistance = cluster([h for h in swing_highs if h > price])
-    support    = cluster([l for l in swing_lows  if l < price])
-
-    nearest_r = min(resistance, key=lambda x: abs(x - price)) if resistance else None
-    nearest_s = max(support,    key=lambda x: abs(x - price)) if support    else None
-
-    bnr_bull = None
-    bnr_bear = None
-    last_20  = df.iloc[-20:]
-    all_lvls = swing_highs + swing_lows
-
-    for level in set([round(l, 5) for l in all_lvls]):
-        above = (last_20["close"] > level).sum()
-        below = (last_20["close"] < level).sum()
-
-        if above >= 3 and below >= 2 and price > level and abs(price - level) <= tol:
-            if bnr_bull is None or abs(price - level) < abs(price - bnr_bull):
-                bnr_bull = level
-        if below >= 3 and above >= 2 and price < level and abs(price - level) <= tol:
-            if bnr_bear is None or abs(price - level) < abs(price - bnr_bear):
-                bnr_bear = level
-
-    return {
-        "nearest_resistance": nearest_r,
-        "nearest_support":    nearest_s,
-        "bnr_bull":           bnr_bull,
-        "bnr_bear":           bnr_bear,
-    }
-
-
-# ─── FIBONACCI ───────────────────────────────────────────────────────────────
-def calculate_fibonacci(df, lookback=50):
-    recent     = df.iloc[-lookback:]
-    swing_high = recent["high"].max()
-    swing_low  = recent["low"].min()
-    diff       = swing_high - swing_low
-    price      = df.iloc[-1]["close"]
-    atr        = df.iloc[-1]["atr"]
-
-    fib50  = round(swing_high - 0.500 * diff, 5)
-    fib618 = round(swing_high - 0.618 * diff, 5)
-
-    return {
-        "swing_high":  round(swing_high, 5),
-        "swing_low":   round(swing_low, 5),
-        "fib50":       fib50,
-        "fib618":      fib618,
-        "near_fib50":  abs(price - fib50)  <= 0.5 * atr,
-        "near_fib618": abs(price - fib618) <= 0.5 * atr,
-    }
-
-
-# ─── FAIR VALUE GAP ──────────────────────────────────────────────────────────
-def detect_fvg(df, lookback=30):
-    recent = df.iloc[-(lookback + 2):].reset_index()
-    price  = df.iloc[-1]["close"]
-    atr    = df.iloc[-1]["atr"]
-
-    bullish_fvgs = []
-    bearish_fvgs = []
-
-    for i in range(len(recent) - 2):
-        c1 = recent.iloc[i]
-        c3 = recent.iloc[i + 2]
-
-        if c3["low"] > c1["high"] and price > c1["high"]:
-            bullish_fvgs.append({
-                "date":     str(recent.iloc[i + 1]["time"])[:10],
-                "gap_high": round(float(c3["low"]), 5),
-                "gap_low":  round(float(c1["high"]), 5),
-            })
-        if c3["high"] < c1["low"] and price < c1["low"]:
-            bearish_fvgs.append({
-                "date":     str(recent.iloc[i + 1]["time"])[:10],
-                "gap_high": round(float(c1["low"]), 5),
-                "gap_low":  round(float(c3["high"]), 5),
-            })
-
-    nearest_bull = bullish_fvgs[-1] if bullish_fvgs else None
-    nearest_bear = bearish_fvgs[-1] if bearish_fvgs else None
-
-    bull_active = (
-        nearest_bull is not None and
-        nearest_bull["gap_low"] - 0.5*atr <= price <= nearest_bull["gap_high"] + 0.5*atr
-    )
-    bear_active = (
-        nearest_bear is not None and
-        nearest_bear["gap_low"] - 0.5*atr <= price <= nearest_bear["gap_high"] + 0.5*atr
-    )
-
-    return {
-        "bullish_fvg":    nearest_bull,
-        "bearish_fvg":    nearest_bear,
-        "bullish_active": bull_active,
-        "bearish_active": bear_active,
-    }
+    return lots, round(effective_risk, 0), modifiers
 
 
 # ─── ECONOMIC CALENDAR ───────────────────────────────────────────────────────
@@ -325,371 +389,299 @@ def fetch_economic_events():
         f"?from={today}&to={tomorrow}&token={FINNHUB_API_KEY}"
     )
     try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        events = response.json().get("economicCalendar", [])
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        events = r.json().get("economicCalendar", [])
         return [
             e for e in events
             if e.get("impact") == "high"
-            and e.get("country") in ("US", "GB")
+            and e.get("country") in ("US", "GB", "EU", "AU", "JP")
         ]
     except Exception as e:
-        print(f"Calendar fetch error: {e}")
+        print(f"Calendar error: {e}")
         return []
 
 
-# ─── SCORECARD ───────────────────────────────────────────────────────────────
-def build_scorecard(df, lt_trend, st_trend, h4_conf, h4_detail,
-                    h4_ema50, h4_rsi, levels, fib, fvg):
-    """
-    Scoring:
-      Long-term trend    : 3 pts  (SIDEWAYS = 0)
-      Short-term trend   : 2 pts  (NEUTRAL  = 0)
-      Price vs 50 EMA    : 2 pts
-      50 EMA vs 200 EMA  : 2 pts
-      4H confirmation    : 2 pts  (NEUTRAL  = 0)
-      Break-and-retest   : 3 pts
-      FVG active         : 2 pts
-      Fib 0.618          : 2 pts  (confluence bonus)
-      Fib 0.500          : 1 pt   (confluence bonus)
-      RSI                : 1 pt
-      ATR                : info only
+# ─── ANALYSE SINGLE PAIR ─────────────────────────────────────────────────────
+def analyse_pair(pair, df, df_4h, comm_df, size_modifier):
+    cfg       = PAIRS[pair]
+    l         = df.iloc[-1]
+    prev      = df.iloc[-2]
 
-    CONFIRMED >= 8 | WATCH 5-7 | NO TRADE < 5
-    """
-    latest   = df.iloc[-1]
-    previous = df.iloc[-2]
+    price     = round(l["close"], 5)
+    e50       = round(l["ema50"], 5)
+    e200      = round(l["ema200"], 5)
+    rsi       = round(l["rsi"], 1)
+    atr       = round(l["atr"], 5)
+    adx       = round(l["adx"], 1)
+    pdi       = round(l["pdi"], 1)
+    ndi       = round(l["ndi"], 1)
 
-    price  = latest["close"]
-    ema20  = latest["ema20"]
-    ema50  = latest["ema50"]
-    ema200 = latest["ema200"]
-    rsi    = latest["rsi"]
-    atr    = latest["atr"]
+    price_dir = "▲" if price > prev["close"] else "▼"
+    e50_dir   = "▲" if e50  > prev["ema50"]  else "▼"
+    e200_dir  = "▲" if e200 > prev["ema200"] else "▼"
+    rsi_dir   = "▲" if rsi  > prev["rsi"]    else "▼"
+    price_chg = round(price - prev["close"], 5)
+    chg_str   = f"+{price_chg}" if price_chg > 0 else str(price_chg)
 
-    prev_close  = previous["close"]
-    prev_ema20  = previous["ema20"]
-    prev_ema50  = previous["ema50"]
-    prev_ema200 = previous["ema200"]
-    prev_rsi    = previous["rsi"]
-    prev_atr    = previous["atr"]
+    regime, adx_val, direction_hint = classify_regime(df)
+    diff, rate_bias, rate_detail    = get_rate_differential(pair)
+    comm_align, comm_detail         = get_commodity_alignment(comm_df, "BUY", pair)
 
-    price_dir  = "▲" if price  > prev_close  else "▼"
-    ema20_dir  = "▲" if ema20  > prev_ema20  else "▼"
-    ema50_dir  = "▲" if ema50  > prev_ema50  else "▼"
-    ema200_dir = "▲" if ema200 > prev_ema200 else "▼"
-    rsi_dir    = "▲" if rsi    > prev_rsi    else "▼"
-    atr_dir    = "▲" if atr    > prev_atr    else "▼"
-
-    ema50_zone_low  = round(ema50 - 0.75 * atr, 5)
-    ema50_zone_high = round(ema50 + 0.75 * atr, 5)
-
-    rows       = []
-    bull_score = 0
-    bear_score = 0
-
-    # ── TREND ──────────────────────────────────────────────────────────────
-    lt_icon = {"BULLISH": "📈", "BEARISH": "📉", "SIDEWAYS": "➡️"}.get(lt_trend, "➡️")
-    if lt_trend == "BULLISH":
-        rows.append(("✅", f"Long-Term {ema200_dir}", f"{lt_icon} BULLISH", "Price > rising 200 EMA"))
-        bull_score += 3
-    elif lt_trend == "BEARISH":
-        rows.append(("❌", f"Long-Term {ema200_dir}", f"{lt_icon} BEARISH", "Price < falling 200 EMA"))
-        bear_score += 3
-    else:
-        rows.append(("⚠️ ", f"Long-Term {ema200_dir}", f"{lt_icon} SIDEWAYS", "Range market — BNR entries preferred"))
-
-    st_icon = {"BULLISH": "📈", "BEARISH": "📉", "NEUTRAL": "➡️"}.get(st_trend, "➡️")
-    if st_trend == "BULLISH":
-        rows.append(("✅", f"Short-Term {ema20_dir}", f"{st_icon} BULLISH", f"20 EMA: {round(ema20,5)}  Price above & rising"))
-        bull_score += 2
-    elif st_trend == "BEARISH":
-        rows.append(("❌", f"Short-Term {ema20_dir}", f"{st_icon} BEARISH", f"20 EMA: {round(ema20,5)}  Price below & falling"))
-        bear_score += 2
-    else:
-        rows.append(("⚠️ ", f"Short-Term {ema20_dir}", f"{st_icon} NEUTRAL", f"20 EMA: {round(ema20,5)}  No clear direction"))
-
-    # ── 4H CONFIRMATION ────────────────────────────────────────────────────
-    rows.append(("──", "SEP", "", ""))
-
-    h4_icon = {"BULL": "📈", "BEAR": "📉", "NEUTRAL": "➡️"}.get(h4_conf, "➡️")
-    if h4_conf == "BULL":
-        rows.append(("✅", "4H Confirmation", f"{h4_icon} BULLISH", h4_detail))
-        bull_score += 2
-    elif h4_conf == "BEAR":
-        rows.append(("❌", "4H Confirmation", f"{h4_icon} BEARISH", h4_detail))
-        bear_score += 2
-    else:
-        rows.append(("⚠️ ", "4H Confirmation", f"{h4_icon} NEUTRAL", h4_detail))
-
-    # ── PRICE & EMAS ───────────────────────────────────────────────────────
-    rows.append(("──", "SEP", "", ""))
-
-    price_change = round(price - prev_close, 5)
-    change_str   = f"+{price_change}" if price_change > 0 else str(price_change)
-    rows.append(("  ", f"Current Price {price_dir}", str(round(price, 5)), f"{change_str} from yesterday"))
-
-    if price > ema50:
-        rows.append(("✅", f"50 EMA {ema50_dir}", str(round(ema50, 5)), f"Entry zone {ema50_zone_low}-{ema50_zone_high}"))
-        bull_score += 2
-    else:
-        rows.append(("❌", f"50 EMA {ema50_dir}", str(round(ema50, 5)), f"Entry zone {ema50_zone_low}-{ema50_zone_high}"))
-        bear_score += 2
-
-    if ema50 > ema200:
-        rows.append(("✅", f"200 EMA {ema200_dir}", str(round(ema200, 5)), "50 EMA above = bull structure"))
-        bull_score += 2
-    else:
-        rows.append(("❌", f"200 EMA {ema200_dir}", str(round(ema200, 5)), "50 EMA below = bear structure"))
-        bear_score += 2
-
-    rsi_val = f"{round(rsi,1)}"
-    if 40 <= rsi <= 65:
-        rows.append(("✅", f"RSI (14) {rsi_dir}", rsi_val, "Ideal range 40-65"))
-        bull_score += 1
-    elif rsi < 30:
-        rows.append(("✅", f"RSI (14) {rsi_dir}", rsi_val, "Oversold — bullish reversal zone"))
-        bull_score += 1
-    elif rsi > 70:
-        rows.append(("❌", f"RSI (14) {rsi_dir}", rsi_val, "Overbought — avoid buying here"))
-        bear_score += 1
-    elif 30 <= rsi < 40:
-        rows.append(("⚠️ ", f"RSI (14) {rsi_dir}", rsi_val, "Approaching oversold"))
-    else:
-        rows.append(("⚠️ ", f"RSI (14) {rsi_dir}", rsi_val, "Neutral zone"))
-
-    atr_note = "Expanding — wider stops" if atr > prev_atr else "Contracting — tighter stops"
-    rows.append(("ℹ️ ", f"ATR (14) {atr_dir}", str(round(atr, 5)), atr_note))
-
-    # ── KEY LEVELS & BNR ───────────────────────────────────────────────────
-    rows.append(("──", "SEP", "", ""))
-
-    nr = levels["nearest_resistance"]
-    ns = levels["nearest_support"]
-    rows.append(("  ", "Nearest Resistance", str(nr) if nr else "None", "Watch for rejection or break"))
-    rows.append(("  ", "Nearest Support",    str(ns) if ns else "None", "Watch for bounce or break"))
-
-    if levels["bnr_bull"]:
-        rows.append(("✅", "Break & Retest", f"BULLISH at {levels['bnr_bull']}", "Broken resistance = new support — high conviction"))
-        bull_score += 3
-    elif levels["bnr_bear"]:
-        rows.append(("❌", "Break & Retest", f"BEARISH at {levels['bnr_bear']}", "Broken support = new resistance — high conviction"))
-        bear_score += 3
-    else:
-        rows.append(("—", "Break & Retest", "None active", "No confirmed BNR setup"))
-
-    # ── FVG ────────────────────────────────────────────────────────────────
-    rows.append(("──", "SEP", "", ""))
-
-    if fvg["bullish_active"]:
-        g = fvg["bullish_fvg"]
-        rows.append(("✅", "Fair Value Gap", "BULLISH ACTIVE", f"Zone {g['gap_low']}-{g['gap_high']} ({g['date']})"))
-        bull_score += 2
-    elif fvg["bearish_active"]:
-        g = fvg["bearish_fvg"]
-        rows.append(("❌", "Fair Value Gap", "BEARISH ACTIVE", f"Zone {g['gap_low']}-{g['gap_high']} ({g['date']})"))
-        bear_score += 2
-    elif fvg["bullish_fvg"]:
-        g = fvg["bullish_fvg"]
-        rows.append(("—", "Fair Value Gap", "Bullish unfilled", f"Zone {g['gap_low']}-{g['gap_high']} ({g['date']})"))
-    elif fvg["bearish_fvg"]:
-        g = fvg["bearish_fvg"]
-        rows.append(("—", "Fair Value Gap", "Bearish unfilled", f"Zone {g['gap_low']}-{g['gap_high']} ({g['date']})"))
-    else:
-        rows.append(("—", "Fair Value Gap", "None detected", ""))
-
-    # ── FIBONACCI ──────────────────────────────────────────────────────────
-    rows.append(("──", "SEP", "", ""))
-
-    if fib["near_fib618"]:
-        rows.append(("✅", "Fib 0.618", str(fib["fib618"]), "CONFLUENCE — price at key retracement"))
-        bull_score += 2
-        bear_score += 2
-    else:
-        rows.append(("—", "Fib 0.618", str(fib["fib618"]), "Key retracement level"))
-
-    if fib["near_fib50"]:
-        rows.append(("✅", "Fib 0.500", str(fib["fib50"]), "CONFLUENCE — price at mid retracement"))
-        bull_score += 1
-        bear_score += 1
-    else:
-        rows.append(("—", "Fib 0.500", str(fib["fib50"]), "Mid retracement level"))
-
-    rows.append(("  ", "Swing High", str(fib["swing_high"]), "50-candle high"))
-    rows.append(("  ", "Swing Low",  str(fib["swing_low"]),  "50-candle low"))
-
-    return rows, bull_score, bear_score
-
-
-# ─── SIGNAL ENGINE ───────────────────────────────────────────────────────────
-def generate_signal(df, df_4h, events):
-    latest = df.iloc[-1]
-    price  = latest["close"]
-    ema50  = latest["ema50"]
-    atr    = latest["atr"]
-
-    lt_trend, lt_detail         = classify_long_term_trend(df)
-    st_trend, st_detail         = classify_short_term_trend(df)
-    h4_conf, h4_detail, h4_ema50, h4_rsi = get_4h_confirmation(df_4h)
-    levels                      = detect_key_levels_and_bnr(df)
-    fib                         = calculate_fibonacci(df)
-    fvg                         = detect_fvg(df)
-    scorecard, bull_score, bear_score = build_scorecard(
-        df, lt_trend, st_trend, h4_conf, h4_detail,
-        h4_ema50, h4_rsi, levels, fib, fvg
-    )
-
-    news_today = len(events) > 0
-
-    # 4H must not contradict the daily signal
-    if bull_score >= 8:
-        if h4_conf == "BEAR":
-            raw        = "WATCH — BUY BIAS (4H CONTRADICTS)"
-            raw_detail = f"Daily score {bull_score}/10 but 4H is bearish. Wait for 4H to align."
-        else:
-            raw        = "CONFIRMED BUY"
-            raw_detail = f"Score {bull_score}/10 — Daily + 4H aligned. Limit at 50 EMA ({round(ema50,5)})."
-    elif bear_score >= 8:
-        if h4_conf == "BULL":
-            raw        = "WATCH — SELL BIAS (4H CONTRADICTS)"
-            raw_detail = f"Daily score {bear_score}/10 but 4H is bullish. Wait for 4H to align."
-        else:
-            raw        = "CONFIRMED SELL"
-            raw_detail = f"Score {bear_score}/10 — Daily + 4H aligned. Limit at 50 EMA ({round(ema50,5)})."
-    elif bull_score >= 5:
-        raw        = "WATCH — BUY SETUP FORMING"
-        raw_detail = f"Score {bull_score}/10 — Not enough confluence yet. Monitor."
-    elif bear_score >= 5:
-        raw        = "WATCH — SELL SETUP FORMING"
-        raw_detail = f"Score {bear_score}/10 — Not enough confluence yet. Monitor."
-    else:
-        raw        = "NO TRADE"
-        raw_detail = f"Bull {bull_score}/10  Bear {bear_score}/10 — No edge. Stay out."
-
-    if news_today:
-        action        = "STAND DOWN — HIGH IMPACT NEWS TODAY"
-        action_detail = f"Underlying setup: {raw} — Do NOT trade into news. Reassess tomorrow."
-    else:
-        action        = raw
-        action_detail = raw_detail
-
-    return {
-        "action":        action,
-        "action_detail": action_detail,
-        "bull_score":    bull_score,
-        "bear_score":    bear_score,
-        "price":         round(price, 5),
-        "ema50":         round(ema50, 5),
-        "ema200":        round(df.iloc[-1]["ema200"], 5),
-        "rsi":           round(df.iloc[-1]["rsi"], 2),
-        "atr":           round(atr, 5),
-        "fib50":         fib["fib50"],
-        "fib618":        fib["fib618"],
-        "stop_buy":      round(price - 1.5 * atr, 5),
-        "target_buy":    round(price + 3.0 * atr, 5),
-        "stop_sell":     round(price + 1.5 * atr, 5),
-        "target_sell":   round(price - 3.0 * atr, 5),
-        "lt_trend":      lt_trend,
-        "st_trend":      st_trend,
-        "h4_conf":       h4_conf,
-        "scorecard":     scorecard,
-        "news_warning":  news_today,
-        "events":        [e.get("event", "Unknown") for e in events],
+    result = {
+        "pair":        pair,
+        "price":       price,
+        "price_dir":   price_dir,
+        "price_chg":   chg_str,
+        "e50":         e50,
+        "e50_dir":     e50_dir,
+        "e200":        e200,
+        "e200_dir":    e200_dir,
+        "rsi":         rsi,
+        "rsi_dir":     rsi_dir,
+        "atr":         atr,
+        "adx":         adx,
+        "pdi":         pdi,
+        "ndi":         ndi,
+        "regime":      regime,
+        "direction_hint": direction_hint,
+        "rate_bias":   rate_bias,
+        "rate_detail": rate_detail,
+        "signal":      "NO_SIGNAL",
+        "strategy":    None,
+        "direction":   None,
+        "entry":       None,
+        "stop":        None,
+        "target":      None,
+        "lots":        None,
+        "effective_risk": None,
+        "modifiers":   [],
+        "rr":          None,
+        "range_high":  None,
+        "range_low":   None,
+        "range_mid":   None,
+        "h4_checks":   0,
+        "h4_rsi":      None,
+        "comm_align":  comm_align,
+        "comm_detail": comm_detail,
+        "comm_label":  cfg["comm_label"],
     }
+
+    if regime == "TRENDING":
+        sig, h4c, h4rsi = strategy_a_signal(df, df_4h)
+        result["strategy"]  = "A — Trend Following"
+        result["h4_checks"] = h4c
+        result["h4_rsi"]    = h4rsi
+
+        if sig in ("BUY", "BUY_NO4H", "SELL", "SELL_NO4H"):
+            direction = "BUY" if "BUY" in sig else "SELL"
+            result["direction"] = direction
+            ca, cd = get_commodity_alignment(comm_df, direction, pair)
+            result["comm_align"]  = ca
+            result["comm_detail"] = cd
+
+            lots, eff_risk, mods = calculate_position_size(
+                l["atr"], price, pair, size_modifier, ca, rate_bias, direction
+            )
+
+            if direction == "BUY":
+                stop   = round(price - ATR_STOP_MULT * l["atr"], 5)
+                target = round(price + 2.5  * ATR_STOP_MULT * l["atr"], 5)
+            else:
+                stop   = round(price + ATR_STOP_MULT * l["atr"], 5)
+                target = round(price - 2.5  * ATR_STOP_MULT * l["atr"], 5)
+
+            rr     = round(abs(target - price) / abs(stop - price), 1)
+            status = sig if sig in ("BUY", "SELL") else f"{sig} (4H blocked)"
+
+            result.update({
+                "signal":         status,
+                "entry":          price,
+                "stop":           stop,
+                "target":         target,
+                "lots":           lots,
+                "effective_risk": eff_risk,
+                "modifiers":      mods,
+                "rr":             rr,
+            })
+        else:
+            result["signal"] = sig
+
+    elif regime == "RANGING":
+        sig, h4c, h4rsi, rh, rl, rm = strategy_b_signal(df, df_4h)
+        result["strategy"]   = "B — Mean Reversion"
+        result["h4_checks"]  = h4c
+        result["h4_rsi"]     = h4rsi
+        result["range_high"] = round(rh, 5)
+        result["range_low"]  = round(rl, 5)
+        result["range_mid"]  = round(rm, 5)
+
+        if sig in ("BUY", "BUY_NO4H", "SELL", "SELL_NO4H"):
+            direction = "BUY" if "BUY" in sig else "SELL"
+            result["direction"] = direction
+            ca, cd = get_commodity_alignment(comm_df, direction, pair)
+            result["comm_align"]  = ca
+            result["comm_detail"] = cd
+
+            lots, eff_risk, mods = calculate_position_size(
+                l["atr"], price, pair, size_modifier, ca, rate_bias, direction
+            )
+
+            if direction == "BUY":
+                stop   = round(rl - l["atr"], 5)
+                target = round(rm, 5)
+            else:
+                stop   = round(rh + l["atr"], 5)
+                target = round(rm, 5)
+
+            rr     = round(abs(target - price) / max(abs(stop - price), 0.00001), 1)
+            status = sig if sig in ("BUY", "SELL") else f"{sig} (4H blocked)"
+
+            result.update({
+                "signal":         status,
+                "entry":          price,
+                "stop":           stop,
+                "target":         target,
+                "lots":           lots,
+                "effective_risk": eff_risk,
+                "modifiers":      mods,
+                "rr":             rr,
+            })
+        else:
+            result["signal"] = sig
+
+    else:
+        result["strategy"] = "NONE — Ambiguous regime"
+        result["signal"]   = "STAND DOWN — Ambiguous ADX"
+
+    return result
 
 
 # ─── EMAIL ───────────────────────────────────────────────────────────────────
-def build_and_send_email(data):
+def build_and_send_email(pair_results, events, time_filter_msg, size_modifier):
     ny_tz   = pytz.timezone("America/New_York")
     ny_time = datetime.now(ny_tz).strftime("%A %d %B %Y - %I:%M %p EST")
     ny_date = datetime.now(ny_tz).strftime("%d %b %Y")
 
-    if   "CONFIRMED BUY"  in data["action"]: action_emoji = "🟢"
-    elif "CONFIRMED SELL" in data["action"]: action_emoji = "🔴"
-    elif "WATCH"          in data["action"]: action_emoji = "🟡"
-    elif "STAND DOWN"     in data["action"]: action_emoji = "⛔"
-    else:                                    action_emoji = "⚪"
+    def sig_emoji(sig):
+        if "BUY" in sig and "BIAS" not in sig and "NO4H" not in sig: return "🟢"
+        if "SELL" in sig and "BIAS" not in sig and "NO4H" not in sig: return "🔴"
+        if "BIAS" in sig or "NO4H" in sig: return "🟡"
+        if "STAND DOWN" in sig: return "⛔"
+        return "⚪"
 
-    col1 = 5
-    col2 = 22
-    col3 = 16
-    col4 = 38
+    # Count actionable signals
+    confirmed = [r for r in pair_results if r["signal"] in ("BUY","SELL")]
+    watch     = [r for r in pair_results if "BIAS" in r["signal"] or "NO4H" in r["signal"]]
 
-    divider = "  " + "-" * (col1 + col2 + col3 + col4) + "\n"
-    table   = divider
-    table  += f"  {'':>{col1}}  {'INDICATOR':<{col2}}  {'CURRENT':<{col3}}  {'IDEAL RANGE / INFO':<{col4}}\n"
-    table  += divider
-
-    for status, indicator, current, info in data["scorecard"]:
-        if indicator == "SEP":
-            table += divider
-            continue
-        table += f"  {status:<{col1}}  {indicator:<{col2}}  {current:<{col3}}  {info:<{col4}}\n"
-
-    table += divider
-    table += f"  {'':>{col1}}  {'BULL SCORE':<{col2}}  {str(data['bull_score']) + '/10':<{col3}}\n"
-    table += f"  {'':>{col1}}  {'BEAR SCORE':<{col2}}  {str(data['bear_score']) + '/10':<{col3}}\n"
-    table += divider
-
+    # News block
     news_block = ""
-    if data["news_warning"]:
-        event_lines = "\n".join(f"    {e}" for e in data["events"])
-        news_block  = f"""
-------------------------------------------------------------
-⛔ HIGH IMPACT NEWS TODAY — DO NOT TRADE
-------------------------------------------------------------
-{event_lines}
+    if events:
+        ev_lines   = "\n".join(f"  ⚠️  {e.get('event','?')} ({e.get('country','?')})" for e in events)
+        news_block = f"""
+╔══════════════════════════════════════════════════════════════╗
+  ⛔ HIGH IMPACT NEWS TODAY — VERIFY BEFORE TRADING
+{ev_lines}
+╚══════════════════════════════════════════════════════════════╝
 """
 
-    body = f"""GBP/USD DAILY SIGNAL REPORT
+    # Time filter
+    tf_block = ""
+    if time_filter_msg:
+        tf_block = f"\n⚠️  TIME FILTER: {time_filter_msg}"
+    if size_modifier < 1.0:
+        tf_block += f"\n⚠️  POSITION SIZE: Reduced to {int(size_modifier*100)}% this period"
+
+    # Pair blocks
+    pair_blocks = ""
+    for r in pair_results:
+        emoji  = sig_emoji(r["signal"])
+        regime_icon = {"TRENDING": "📈", "RANGING": "➡️", "AMBIGUOUS": "⚠️ "}.get(r["regime"], "")
+        comm_icon   = {"ALIGNED": "✅", "NEUTRAL": "—", "CONTRARY": "❌"}.get(r["comm_align"], "—")
+        rate_icon   = {"BULLISH": "✅", "NEUTRAL": "—", "BEARISH": "❌"}.get(r["rate_bias"], "—")
+        h4_icon     = "✅" if r["h4_checks"] >= 2 else "❌"
+
+        entry_block = ""
+        if r["signal"] in ("BUY","SELL"):
+            direction  = r["direction"]
+            mod_str    = "  " + "\n  ".join(r["modifiers"]) if r["modifiers"] else "  None — full size"
+            entry_block = f"""
+  ┌─────────────────────────────────────┐
+  │  {direction} SIGNAL — EXECUTE             │
+  ├─────────────────────────────────────┤
+  │  Entry  : {str(r['entry']):<27}│
+  │  Stop   : {str(r['stop']):<27}│
+  │  Target : {str(r['target']):<27}│
+  │  R:R    : 1:{str(r['rr']):<26}│
+  │  Size   : {str(r['lots']):<5} lots  (${r['effective_risk']:,.0f} risk)   │
+  └─────────────────────────────────────┘
+  Size modifiers:
+{mod_str}"""
+        elif "BIAS" in r["signal"] or "NO4H" in r["signal"]:
+            entry_block = f"\n  ⏳ {r['signal']} — Wait for full conditions"
+        elif "STAND DOWN" in r["signal"]:
+            entry_block = f"\n  ⛔ {r['signal']}"
+        else:
+            entry_block = f"\n  ⚪ No setup today"
+
+        range_block = ""
+        if r["range_high"]:
+            range_block = f"""
+  Range    : {r['range_low']} — {r['range_high']}  ({RANGE_LOOKBACK}-day)
+  Mid      : {r['range_mid']}"""
+
+        pair_blocks += f"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  {emoji}  {r['pair'].replace('_','/')}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Regime   : {regime_icon} {r['regime']}  (ADX {r['adx']} | +DI {r['pdi']} / -DI {r['ndi']})
+  Strategy : {r['strategy']}
+{entry_block}
+
+  ─── Market Snapshot ────────────────────────────────────────
+  Price    : {r['price']} {r['price_dir']}  ({r['price_chg']} today)
+  50 EMA   : {r['e50']} {r['e50_dir']}
+  200 EMA  : {r['e200']} {r['e200_dir']}
+  RSI (14) : {r['rsi']} {r['rsi_dir']}
+  ATR (14) : {r['atr']}
+{range_block}
+
+  ─── Confluence Filters ─────────────────────────────────────
+  {h4_icon}  4H Confirm  : {r['h4_checks']}/3 checks  (4H RSI {r['h4_rsi']})
+  {comm_icon}  {r['comm_label']:<10}  : {r['comm_align']}  — {r['comm_detail']}
+  {rate_icon}  Rate Diff   : {r['rate_bias']}  — {r['rate_detail']}
+"""
+
+    summary = f"{len(confirmed)} confirmed | {len(watch)} watching | {4-len(confirmed)-len(watch)} no signal"
+
+    body = f"""DAILY FOREX SIGNAL REPORT
 {ny_time}
-============================================================
-
-{action_emoji} {data['action']}
-   {data['action_detail']}
+════════════════════════════════════════════════════════════════
+{summary}
+{tf_block}
 {news_block}
-------------------------------------------------------------
-MARKET SNAPSHOT & SCORECARD
-------------------------------------------------------------
-{table}
-------------------------------------------------------------
-RISK LEVELS  (CONFIRMED signals only)
-------------------------------------------------------------
-  Entry  : Limit order at 50 EMA ({data['ema50']})
-           or at Break-and-Retest level if BNR active
+{pair_blocks}
+════════════════════════════════════════════════════════════════
+STRATEGY GUIDE
+  Strategy A (Trending)  : ADX > 25 | Price touches 50 EMA | 4H confirms
+  Strategy B (Ranging)   : ADX < 20 | Price at range boundary | RSI extreme
+  Ambiguous ADX 20-25    : Stand down — no edge
+  Size modifiers         : Contrary commodity × 0.5 | Contrary rates × 0.5
 
-  IF BUYING:
-    Stop   : {data['stop_buy']}
-    Target : {data['target_buy']}
-    R:R    : 1:2
+RISK RULES
+  Max open trades        : 4 (one per pair)
+  Max same-direction     : 2 (no full USD stack)
+  Risk per trade         : $2,000 base (modified by filters)
+  No trades              : Fridays | Dec 18–Jan 5 | 3+ news events
 
-  IF SELLING:
-    Stop   : {data['stop_sell']}
-    Target : {data['target_sell']}
-    R:R    : 1:2
+────────────────────────────────────────────────────────────────
+Multi-Pair Trading System v2.0 | Regime-Adaptive"""
 
-------------------------------------------------------------
-SCORING GUIDE
-------------------------------------------------------------
-  🟢 CONFIRMED  8+/10  Execute — daily + 4H aligned
-  🟡 WATCH      5-7    Setup forming — do not enter yet
-  ⚪ NO TRADE   0-4    No edge — stay out
-  ⛔ STAND DOWN        News day — wait regardless of score
+    subject = f"Forex Signals: {summary} | {ny_date}"
 
-  4H confirmation required — daily score alone is not enough
-  BNR + FVG + Fib confluence = maximum conviction entry
-
-------------------------------------------------------------
-GBP/USD Trading System v1.6"""
-
-    subject = f"GBP/USD: {action_emoji} {data['action']} | Bull {data['bull_score']}/10  Bear {data['bear_score']}/10 | {ny_date}"
-
-    response = requests.post(
+    r = requests.post(
         "https://api.sendgrid.com/v3/mail/send",
-        headers={
-            "Authorization": f"Bearer {SENDGRID_API_KEY}",
-            "Content-Type":  "application/json",
-        },
+        headers={"Authorization": f"Bearer {SENDGRID_API_KEY}", "Content-Type": "application/json"},
         json={
             "personalizations": [{"to": [{"email": EMAIL_RECIPIENT}]}],
             "from":    {"email": EMAIL_SENDER},
@@ -697,42 +689,91 @@ GBP/USD Trading System v1.6"""
             "content": [{"type": "text/plain", "value": body}],
         }
     )
-    response.raise_for_status()
+    r.raise_for_status()
     print(f"Email sent at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 
 # ─── MAIN JOB ────────────────────────────────────────────────────────────────
 def run_signal_job():
-    print(f"\n{'='*40}")
-    print(f"Running signal job at {datetime.now(timezone.utc)} UTC")
-    print(f"{'='*40}")
+    print(f"\n{'='*50}")
+    print(f"Signal job at {datetime.now(timezone.utc)} UTC")
+    print(f"{'='*50}")
+
     try:
-        print("Fetching daily candles...")
-        df = fetch_candles(granularity="D", count=250)
-        df = calculate_indicators(df)
+        # Time filter
+        can_trade, size_modifier, tf_msg = time_filter()
+        print(f"Time filter: {'OK' if can_trade else 'BLOCKED'}  {tf_msg}")
+        if not can_trade:
+            print("Skipping — time filter blocked trading today")
+            # Still send email to notify
+            size_modifier = 0.0
 
-        print("Fetching 4H candles...")
-        df_4h = fetch_candles(granularity="H4", count=300)
-        df_4h = calculate_indicators(df_4h)
-
+        # Economic calendar
         print("Fetching economic calendar...")
         events = fetch_economic_events()
 
-        print("Generating signal...")
-        signal_data = generate_signal(df, df_4h, events)
-        print(f"Action: {signal_data['action']} | Bull: {signal_data['bull_score']} Bear: {signal_data['bear_score']} | 4H: {signal_data['h4_conf']}")
+        # Fetch commodity data (shared across pairs)
+        print("Fetching commodity data...")
+        try:
+            gold_df = fetch_candles("XAU_USD", "D", 250)
+            gold_df = calculate_indicators(gold_df)
+        except Exception as e:
+            print(f"Gold fetch failed: {e}")
+            gold_df = None
+
+        try:
+            oil_df = fetch_candles("WTICO_USD", "D", 250)
+            oil_df = calculate_indicators(oil_df)
+        except Exception as e:
+            print(f"Oil fetch failed: {e}")
+            oil_df = None
+
+        # Analyse each pair
+        pair_results = []
+        for pair in PAIRS:
+            print(f"Analysing {pair}...")
+            try:
+                df    = fetch_candles(pair, "D", 250)
+                df    = calculate_indicators(df)
+                df_4h = fetch_candles(pair, "H4", 300)
+                df_4h = calculate_indicators(df_4h)
+
+                # Assign correct commodity
+                comm_df = gold_df if PAIRS[pair]["commodity"] == "XAU_USD" else oil_df
+
+                result = analyse_pair(pair, df, df_4h, comm_df,
+                                      size_modifier if can_trade else 0.0)
+                pair_results.append(result)
+                print(f"  {pair}: {result['regime']} | {result['signal']}")
+
+            except Exception as e:
+                print(f"  {pair} failed: {e}")
+                pair_results.append({
+                    "pair": pair, "signal": "ERROR", "strategy": f"Error: {e}",
+                    "regime": "ERROR", "price": 0, "price_dir": "", "price_chg": "",
+                    "e50": 0, "e50_dir": "", "e200": 0, "e200_dir": "",
+                    "rsi": 0, "rsi_dir": "", "atr": 0, "adx": 0, "pdi": 0, "ndi": 0,
+                    "direction_hint": "", "rate_bias": "", "rate_detail": "",
+                    "comm_align": "", "comm_detail": "", "comm_label": "",
+                    "direction": None, "entry": None, "stop": None, "target": None,
+                    "lots": None, "effective_risk": None, "modifiers": [], "rr": None,
+                    "range_high": None, "range_low": None, "range_mid": None,
+                    "h4_checks": 0, "h4_rsi": None,
+                })
 
         print("Sending email...")
-        build_and_send_email(signal_data)
+        build_and_send_email(pair_results, events, tf_msg, size_modifier)
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Job error: {e}")
 
 
 # ─── SCHEDULER ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("GBP/USD Signal System starting...")
-    print("Scheduled daily at 5:00 PM EST (New York close)")
+    print("Multi-Pair Forex Signal System v2.0")
+    print("Pairs: GBP/USD | EUR/USD | AUD/USD | USD/JPY")
+    print("Scheduled: 5:00 PM EST (NY close) daily")
+    print()
 
     run_signal_job()
 
