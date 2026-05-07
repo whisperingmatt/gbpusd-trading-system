@@ -101,9 +101,9 @@ def classify_long_term_trend(df):
         position = "upper half" if in_upper_half else "lower half"
         return "SIDEWAYS", f"Channel {round(low_200,4)}-{round(high_200,4)} | In {position}"
     elif price > ema200_now and slope_20 > 0.05 and slope_50 > 0.1:
-        return "BULLISH", f"200 EMA rising | Price above"
+        return "BULLISH", "200 EMA rising | Price above"
     elif price < ema200_now and slope_20 < -0.05 and slope_50 < -0.1:
-        return "BEARISH", f"200 EMA falling | Price below"
+        return "BEARISH", "200 EMA falling | Price below"
     elif is_wide_range and in_upper_half:
         return "SIDEWAYS", f"Channel {round(low_200,4)}-{round(high_200,4)} | In upper half"
     else:
@@ -123,6 +123,99 @@ def classify_short_term_trend(df):
         return "BEARISH", f"Price below falling 20 EMA ({round(ema20_now,5)})"
     else:
         return "NEUTRAL", f"Price near 20 EMA ({round(ema20_now,5)}) — no clear direction"
+
+
+# ─── KEY LEVELS & BREAK-AND-RETEST ───────────────────────────────────────────
+def detect_key_levels_and_bnr(df, lookback=200, tolerance_atr=0.75):
+    """
+    Identifies significant support and resistance levels from the last
+    `lookback` candles by finding swing highs and lows — price points
+    where the market reversed at least twice (tested the level multiple times).
+
+    Break-and-retest logic:
+    - BULLISH BNR: price recently broke ABOVE a resistance level, then
+      pulled back to retest it as support. Old resistance = new support.
+    - BEARISH BNR: price recently broke BELOW a support level, then
+      rallied back to retest it as resistance. Old support = new resistance.
+
+    A retest is valid if:
+    - The break happened within the last 20 candles
+    - Price has since pulled back within tolerance_atr of the broken level
+    - Price has not closed back through the broken level
+    """
+    price = df.iloc[-1]["close"]
+    atr   = df.iloc[-1]["atr"]
+    tol   = tolerance_atr * atr
+
+    recent = df.iloc[-lookback:].reset_index()
+
+    # Find swing highs (local maxima) and swing lows (local minima)
+    # A swing high: high[i] is highest of 5-candle window centred on i
+    # A swing low:  low[i]  is lowest  of 5-candle window centred on i
+    swing_highs = []
+    swing_lows  = []
+    window = 5
+
+    for i in range(window, len(recent) - window):
+        hi = recent.iloc[i]["high"]
+        lo = recent.iloc[i]["low"]
+        if hi == recent.iloc[i-window:i+window+1]["high"].max():
+            swing_highs.append(round(hi, 5))
+        if lo == recent.iloc[i-window:i+window+1]["low"].min():
+            swing_lows.append(round(lo, 5))
+
+    # Cluster nearby levels (within 0.5 ATR of each other = same level)
+    def cluster_levels(levels):
+        if not levels:
+            return []
+        levels = sorted(set(levels))
+        clustered = []
+        group = [levels[0]]
+        for lv in levels[1:]:
+            if lv - group[-1] <= 0.5 * atr:
+                group.append(lv)
+            else:
+                clustered.append(round(sum(group) / len(group), 5))
+                group = [lv]
+        clustered.append(round(sum(group) / len(group), 5))
+        return clustered
+
+    resistance_levels = cluster_levels([h for h in swing_highs if h > price])
+    support_levels    = cluster_levels([l for l in swing_lows  if l < price])
+
+    # Nearest levels above and below current price
+    nearest_resistance = min(resistance_levels, key=lambda x: abs(x - price)) if resistance_levels else None
+    nearest_support    = max(support_levels,    key=lambda x: abs(x - price)) if support_levels    else None
+
+    # Break-and-retest detection
+    # Look at last 20 candles for a level break followed by a retest
+    bnr_bull  = None
+    bnr_bear  = None
+    last_20   = df.iloc[-20:]
+    all_levels = swing_highs + swing_lows
+
+    for level in set([round(l, 5) for l in all_levels]):
+        candles_above = (last_20["close"] > level).sum()
+        candles_below = (last_20["close"] < level).sum()
+
+        # Bullish BNR: broke above, now retesting from above
+        if candles_above >= 3 and candles_below >= 2:
+            if price > level and abs(price - level) <= tol:
+                if bnr_bull is None or abs(price - level) < abs(price - bnr_bull):
+                    bnr_bull = level
+
+        # Bearish BNR: broke below, now retesting from below
+        if candles_below >= 3 and candles_above >= 2:
+            if price < level and abs(price - level) <= tol:
+                if bnr_bear is None or abs(price - level) < abs(price - bnr_bear):
+                    bnr_bear = level
+
+    return {
+        "nearest_resistance": nearest_resistance,
+        "nearest_support":    nearest_support,
+        "bnr_bull":           bnr_bull,
+        "bnr_bear":           bnr_bear,
+    }
 
 
 # ─── FIBONACCI ───────────────────────────────────────────────────────────────
@@ -219,18 +312,19 @@ def fetch_economic_events():
 
 
 # ─── SCORECARD ───────────────────────────────────────────────────────────────
-def build_scorecard(df, lt_trend, st_trend, fib, fvg):
+def build_scorecard(df, lt_trend, st_trend, levels, fib, fvg):
     """
     Scoring weights:
-      Long-term trend  : 3 pts   (SIDEWAYS = 0)
-      Short-term trend : 2 pts   (NEUTRAL  = 0)
-      Price vs 50 EMA  : 2 pts
-      50 EMA vs 200 EMA: 2 pts
-      FVG active       : 2 pts
-      Fib 0.618        : 2 pts   (confluence bonus)
-      Fib 0.500        : 1 pt    (confluence bonus)
-      RSI              : 1 pt
-      ATR              : info only
+      Long-term trend        : 3 pts  (SIDEWAYS = 0)
+      Short-term trend       : 2 pts  (NEUTRAL  = 0)
+      Price vs 50 EMA        : 2 pts
+      50 EMA vs 200 EMA      : 2 pts
+      Break-and-retest       : 3 pts  (strongest signal — structure + momentum)
+      FVG active             : 2 pts
+      Fib 0.618 confluence   : 2 pts
+      Fib 0.500 confluence   : 1 pt
+      RSI                    : 1 pt
+      ATR                    : info only
 
     CONFIRMED >= 8 | WATCH 5-7 | NO TRADE < 5
     """
@@ -244,7 +338,7 @@ def build_scorecard(df, lt_trend, st_trend, fib, fvg):
     rsi    = latest["rsi"]
     atr    = latest["atr"]
 
-    prev_close = previous["close"]
+    prev_close  = previous["close"]
     prev_ema20  = previous["ema20"]
     prev_ema50  = previous["ema50"]
     prev_ema200 = previous["ema200"]
@@ -258,7 +352,6 @@ def build_scorecard(df, lt_trend, st_trend, fib, fvg):
     rsi_dir    = "▲" if rsi    > prev_rsi    else "▼"
     atr_dir    = "▲" if atr    > prev_atr    else "▼"
 
-    # Entry zone: price within 0.75x ATR of 50 EMA
     ema50_zone_low  = round(ema50 - 0.75 * atr, 5)
     ema50_zone_high = round(ema50 + 0.75 * atr, 5)
 
@@ -266,41 +359,36 @@ def build_scorecard(df, lt_trend, st_trend, fib, fvg):
     bull_score = 0
     bear_score = 0
 
-    # ── TREND SECTION ──────────────────────────────────────────────────────
+    # ── TREND ──────────────────────────────────────────────────────────────
 
-    # 1. Long-term trend (3 pts)
-    lt_icons = {"BULLISH": "📈", "BEARISH": "📉", "SIDEWAYS": "➡️"}
-    lt_icon  = lt_icons.get(lt_trend, "➡️")
+    lt_icon = {"BULLISH": "📈", "BEARISH": "📉", "SIDEWAYS": "➡️"}.get(lt_trend, "➡️")
     if lt_trend == "BULLISH":
-        rows.append(("✅", f"Long-Term {ema200_dir}", f"{lt_icon} BULLISH", "Ideal: price > 200 EMA"))
+        rows.append(("✅", f"Long-Term {ema200_dir}", f"{lt_icon} BULLISH", "Ideal: price > rising 200 EMA"))
         bull_score += 3
     elif lt_trend == "BEARISH":
-        rows.append(("❌", f"Long-Term {ema200_dir}", f"{lt_icon} BEARISH", "Ideal: price < 200 EMA"))
+        rows.append(("❌", f"Long-Term {ema200_dir}", f"{lt_icon} BEARISH", "Ideal: price < falling 200 EMA"))
         bear_score += 3
     else:
-        rows.append(("⚠️ ", f"Long-Term {ema200_dir}", f"{lt_icon} SIDEWAYS", "No trend — range rules apply"))
+        rows.append(("⚠️ ", f"Long-Term {ema200_dir}", f"{lt_icon} SIDEWAYS", "Range market — BNR entries preferred"))
 
-    # 2. Short-term trend (2 pts)
-    st_icons = {"BULLISH": "📈", "BEARISH": "📉", "NEUTRAL": "➡️"}
-    st_icon  = st_icons.get(st_trend, "➡️")
+    st_icon = {"BULLISH": "📈", "BEARISH": "📉", "NEUTRAL": "➡️"}.get(st_trend, "➡️")
     if st_trend == "BULLISH":
-        rows.append(("✅", f"Short-Term {ema20_dir}", f"{st_icon} BULLISH", f"20 EMA: {round(ema20,5)}  Ideal: price above & rising"))
+        rows.append(("✅", f"Short-Term {ema20_dir}", f"{st_icon} BULLISH", f"20 EMA: {round(ema20,5)}  Price above & rising"))
         bull_score += 2
     elif st_trend == "BEARISH":
-        rows.append(("❌", f"Short-Term {ema20_dir}", f"{st_icon} BEARISH", f"20 EMA: {round(ema20,5)}  Ideal: price below & falling"))
+        rows.append(("❌", f"Short-Term {ema20_dir}", f"{st_icon} BEARISH", f"20 EMA: {round(ema20,5)}  Price below & falling"))
         bear_score += 2
     else:
         rows.append(("⚠️ ", f"Short-Term {ema20_dir}", f"{st_icon} NEUTRAL", f"20 EMA: {round(ema20,5)}  No clear direction"))
 
-    # ── PRICE SECTION ──────────────────────────────────────────────────────
+    # ── PRICE & EMAS ───────────────────────────────────────────────────────
 
-    # 3. Current price (info — not scored)
+    rows.append(("──", "SEP", "", ""))
+
     price_change = round(price - prev_close, 5)
     change_str   = f"+{price_change}" if price_change > 0 else str(price_change)
-    rows.append(("──", "PRICE SEPARATOR", "", ""))
     rows.append(("  ", f"Current Price {price_dir}", str(round(price, 5)), f"{change_str} from yesterday"))
 
-    # 4. 50 EMA — entry level (2 pts)
     if price > ema50:
         rows.append(("✅", f"50 EMA {ema50_dir}", str(round(ema50, 5)), f"Entry zone {ema50_zone_low}-{ema50_zone_high}"))
         bull_score += 2
@@ -308,15 +396,13 @@ def build_scorecard(df, lt_trend, st_trend, fib, fvg):
         rows.append(("❌", f"50 EMA {ema50_dir}", str(round(ema50, 5)), f"Entry zone {ema50_zone_low}-{ema50_zone_high}"))
         bear_score += 2
 
-    # 5. 200 EMA — trend filter (2 pts)
     if ema50 > ema200:
-        rows.append(("✅", f"200 EMA {ema200_dir}", str(round(ema200, 5)), "Bull: 50 EMA above | Bear: 50 EMA below"))
+        rows.append(("✅", f"200 EMA {ema200_dir}", str(round(ema200, 5)), "50 EMA above = bull structure"))
         bull_score += 2
     else:
-        rows.append(("❌", f"200 EMA {ema200_dir}", str(round(ema200, 5)), "Bull: 50 EMA above | Bear: 50 EMA below"))
+        rows.append(("❌", f"200 EMA {ema200_dir}", str(round(ema200, 5)), "50 EMA below = bear structure"))
         bear_score += 2
 
-    # 6. RSI (1 pt)
     rsi_val = f"{round(rsi,1)}"
     if 40 <= rsi <= 65:
         rows.append(("✅", f"RSI (14) {rsi_dir}", rsi_val, "Ideal range 40-65"))
@@ -332,15 +418,38 @@ def build_scorecard(df, lt_trend, st_trend, fib, fvg):
     else:
         rows.append(("⚠️ ", f"RSI (14) {rsi_dir}", rsi_val, "Neutral zone"))
 
-    # 7. FVG (2 pts)
-    rows.append(("──", "FVG SEPARATOR", "", ""))
+    atr_note = "Expanding — wider stops" if atr > prev_atr else "Contracting — tighter stops"
+    rows.append(("ℹ️ ", f"ATR (14) {atr_dir}", str(round(atr, 5)), atr_note))
+
+    # ── KEY LEVELS & BREAK-AND-RETEST ──────────────────────────────────────
+
+    rows.append(("──", "SEP", "", ""))
+
+    nr = levels["nearest_resistance"]
+    ns = levels["nearest_support"]
+    rows.append(("  ", "Nearest Resistance", str(nr) if nr else "None", "Watch for rejection or break"))
+    rows.append(("  ", "Nearest Support",    str(ns) if ns else "None", "Watch for bounce or break"))
+
+    if levels["bnr_bull"]:
+        rows.append(("✅", "Break & Retest", f"BULLISH at {levels['bnr_bull']}", "Broken resistance now support — high conviction entry"))
+        bull_score += 3
+    elif levels["bnr_bear"]:
+        rows.append(("❌", "Break & Retest", f"BEARISH at {levels['bnr_bear']}", "Broken support now resistance — high conviction entry"))
+        bear_score += 3
+    else:
+        rows.append(("—", "Break & Retest", "None active", "No confirmed BNR setup"))
+
+    # ── FVG ────────────────────────────────────────────────────────────────
+
+    rows.append(("──", "SEP", "", ""))
+
     if fvg["bullish_active"]:
         g = fvg["bullish_fvg"]
-        rows.append(("✅", "Fair Value Gap", f"BULLISH ACTIVE", f"Zone {g['gap_low']}-{g['gap_high']} ({g['date']})"))
+        rows.append(("✅", "Fair Value Gap", "BULLISH ACTIVE", f"Zone {g['gap_low']}-{g['gap_high']} ({g['date']})"))
         bull_score += 2
     elif fvg["bearish_active"]:
         g = fvg["bearish_fvg"]
-        rows.append(("❌", "Fair Value Gap", f"BEARISH ACTIVE", f"Zone {g['gap_low']}-{g['gap_high']} ({g['date']})"))
+        rows.append(("❌", "Fair Value Gap", "BEARISH ACTIVE", f"Zone {g['gap_low']}-{g['gap_high']} ({g['date']})"))
         bear_score += 2
     elif fvg["bullish_fvg"]:
         g = fvg["bullish_fvg"]
@@ -351,32 +460,26 @@ def build_scorecard(df, lt_trend, st_trend, fib, fvg):
     else:
         rows.append(("—", "Fair Value Gap", "None detected", ""))
 
-    # 8. ATR (info only)
-    atr_note = "Expanding — wider stops needed" if atr > prev_atr else "Contracting — tighter stops possible"
-    rows.append(("ℹ️ ", f"ATR (14) {atr_dir}", str(round(atr, 5)), atr_note))
+    # ── FIBONACCI ──────────────────────────────────────────────────────────
 
-    # ── FIB SECTION ────────────────────────────────────────────────────────
+    rows.append(("──", "SEP", "", ""))
 
-    rows.append(("──", "FIB SEPARATOR", "", ""))
-
-    # 9. Fib 0.618 (2 pts — confluence bonus)
     if fib["near_fib618"]:
-        rows.append(("✅", "Fib 0.618", str(fib["fib618"]), "CONFLUENCE with entry — high conviction"))
+        rows.append(("✅", "Fib 0.618", str(fib["fib618"]), "CONFLUENCE — price at key retracement"))
         bull_score += 2
         bear_score += 2
     else:
-        rows.append(("—", "Fib 0.618", str(fib["fib618"]), f"Support/resistance level"))
+        rows.append(("—", "Fib 0.618", str(fib["fib618"]), "Key retracement level"))
 
-    # 10. Fib 0.500 (1 pt — confluence bonus)
     if fib["near_fib50"]:
-        rows.append(("✅", "Fib 0.500", str(fib["fib50"]), "CONFLUENCE with entry — added weight"))
+        rows.append(("✅", "Fib 0.500", str(fib["fib50"]), "CONFLUENCE — price at mid retracement"))
         bull_score += 1
         bear_score += 1
     else:
-        rows.append(("—", "Fib 0.500", str(fib["fib50"]), f"Support/resistance level"))
+        rows.append(("—", "Fib 0.500", str(fib["fib50"]), "Mid retracement level"))
 
-    rows.append(("  ", "Swing High", str(fib["swing_high"]), "50-candle reference"))
-    rows.append(("  ", "Swing Low",  str(fib["swing_low"]),  "50-candle reference"))
+    rows.append(("  ", "Swing High", str(fib["swing_high"]), "50-candle high"))
+    rows.append(("  ", "Swing Low",  str(fib["swing_low"]),  "50-candle low"))
 
     return rows, bull_score, bear_score
 
@@ -390,9 +493,12 @@ def generate_signal(df, events):
 
     lt_trend, lt_detail = classify_long_term_trend(df)
     st_trend, st_detail = classify_short_term_trend(df)
+    levels              = detect_key_levels_and_bnr(df)
     fib                 = calculate_fibonacci(df)
     fvg                 = detect_fvg(df)
-    scorecard, bull_score, bear_score = build_scorecard(df, lt_trend, st_trend, fib, fvg)
+    scorecard, bull_score, bear_score = build_scorecard(
+        df, lt_trend, st_trend, levels, fib, fvg
+    )
 
     news_today = len(events) > 0
 
@@ -449,25 +555,24 @@ def build_and_send_email(data):
     ny_time = datetime.now(ny_tz).strftime("%A %d %B %Y - %I:%M %p EST")
     ny_date = datetime.now(ny_tz).strftime("%d %b %Y")
 
-    if "CONFIRMED BUY"  in data["action"]: action_emoji = "🟢"
+    if   "CONFIRMED BUY"  in data["action"]: action_emoji = "🟢"
     elif "CONFIRMED SELL" in data["action"]: action_emoji = "🔴"
     elif "WATCH"          in data["action"]: action_emoji = "🟡"
     elif "STAND DOWN"     in data["action"]: action_emoji = "⛔"
     else:                                    action_emoji = "⚪"
 
-    # Build table — skip separator rows
-    col1 = 5   # status
-    col2 = 22  # indicator
-    col3 = 14  # current value
-    col4 = 35  # ideal range / info
+    col1 = 5
+    col2 = 22
+    col3 = 16
+    col4 = 38
 
-    divider   = "  " + "-" * (col1 + col2 + col3 + col4) + "\n"
-    table     = divider
-    table    += f"  {'':>{col1}}  {'INDICATOR':<{col2}}  {'CURRENT':<{col3}}  {'IDEAL RANGE / INFO':<{col4}}\n"
-    table    += divider
+    divider = "  " + "-" * (col1 + col2 + col3 + col4) + "\n"
+    table   = divider
+    table  += f"  {'':>{col1}}  {'INDICATOR':<{col2}}  {'CURRENT':<{col3}}  {'IDEAL RANGE / INFO':<{col4}}\n"
+    table  += divider
 
     for status, indicator, current, info in data["scorecard"]:
-        if indicator in ("PRICE SEPARATOR", "FVG SEPARATOR", "FIB SEPARATOR"):
+        if indicator == "SEP":
             table += divider
             continue
         table += f"  {status:<{col1}}  {indicator:<{col2}}  {current:<{col3}}  {info:<{col4}}\n"
@@ -477,7 +582,6 @@ def build_and_send_email(data):
     table += f"  {'':>{col1}}  {'BEAR SCORE':<{col2}}  {str(data['bear_score']) + '/10':<{col3}}\n"
     table += divider
 
-    # News block
     news_block = ""
     if data["news_warning"]:
         event_lines = "\n".join(f"    {e}" for e in data["events"])
@@ -503,6 +607,7 @@ MARKET SNAPSHOT & SCORECARD
 RISK LEVELS  (CONFIRMED signals only)
 ------------------------------------------------------------
   Entry  : Limit order at 50 EMA ({data['ema50']})
+           or at Break-and-Retest level if BNR active
 
   IF BUYING:
     Stop   : {data['stop_buy']}
@@ -522,8 +627,11 @@ SCORING GUIDE
   ⚪ NO TRADE   0-4    No edge — stay out
   ⛔ STAND DOWN        News day — wait regardless of score
 
+  Break-and-Retest adds 3pts — highest single signal weight
+  BNR + FVG + Fib confluence = maximum conviction entry
+
 ------------------------------------------------------------
-GBP/USD Trading System v1.4"""
+GBP/USD Trading System v1.5"""
 
     subject = f"GBP/USD: {action_emoji} {data['action']} | Bull {data['bull_score']}/10  Bear {data['bear_score']}/10 | {ny_date}"
 
