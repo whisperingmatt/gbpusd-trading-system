@@ -1,0 +1,6 @@
+oandapyV20
+pandas
+requests
+python-dotenv
+schedule
+pytz
