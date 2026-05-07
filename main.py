@@ -166,10 +166,7 @@ def generate_signal(df, events):
 def build_email(data):
     ny_time = datetime.now(pytz.timezone("America/New_York")).strftime("%A %d %B %Y – %I:%M %p EST")
 
-    signal_emoji = {
-        "BUY":   "🟢",
-        "SELL":  "🔴",
-    }
+    signal_emoji = {"BUY": "🟢", "SELL": "🔴"}
     emoji = next((v for k, v in signal_emoji.items() if k in data["signal"]), "🟡")
 
     news_block = ""
@@ -227,13 +224,10 @@ REMINDERS
 GBP/USD Trading System v1.0
     """
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"GBP/USD Signal: {emoji} {data['signal']} | {datetime.now(pytz.timezone('America/New_York')).strftime('%d %b %Y')}"
-    msg["From"]    = EMAIL_SENDER
-    msg["To"]      = EMAIL_RECIPIENT
-    msg.attach(MIMEText(body, "plain"))
-    return msg
-
+    return {
+        "subject": f"GBP/USD Signal: {emoji} {data['signal']} | {datetime.now(pytz.timezone('America/New_York')).strftime('%d %b %Y')}",
+        "body": body
+    }
 # ─── EMAIL SENDER ─────────────────────────────────────────────────────────────
 def send_email(msg):
     url = "https://api.sendgrid.com/v3/mail/send"
@@ -244,8 +238,8 @@ def send_email(msg):
     payload = {
         "personalizations": [{"to": [{"email": EMAIL_RECIPIENT}]}],
         "from": {"email": EMAIL_SENDER},
-        "subject": msg["Subject"],
-        "content": [{"type": "text/plain", "value": msg.get_payload()}]
+        "subject": msg["subject"],
+        "content": [{"type": "text/plain", "value": msg["body"]()}]
     }
     response = requests.post(url, headers=headers, json=payload)
     response.raise_for_status()
@@ -272,8 +266,8 @@ def run_signal_job():
         print(f"Signal: {signal_data['signal']}")
 
         print("Sending email...")
-        msg = build_email(signal_data)
-        send_email(msg)
+        email = build_email(signal_data)
+        send_email(email)
 
     except Exception as e:
         print(f"❌ Error: {e}")
