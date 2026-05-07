@@ -14,19 +14,19 @@ OANDA_BASE    = (
     if OANDA_ENV == "practice"
     else "https://api-fxtrade.oanda.com/v3"
 )
-INSTRUMENT = "GBP_USD"
+INSTRUMENT = "AUD_USD"
 
 # ---- ACCOUNT SETTINGS -------------------------------------------------------
 STARTING_BALANCE = 100_000.00
 RISK_PER_TRADE   = 2_000.00
-REWARD_RATIO     = 1.0
+REWARD_RATIO     = 2.0
 WIN_AMOUNT       = RISK_PER_TRADE * REWARD_RATIO   # +$4,000
 LOSS_AMOUNT      = RISK_PER_TRADE                  # -$2,000
 EXPIRED_AMOUNT   = -400.00
 
 # ---- STRATEGY RULES ---------------------------------------------------------
 MIN_SCORE        = 9     # raised from 8
-MAX_HOLD_CANDLES = 15    # reduced from 20
+MAX_HOLD_CANDLES = 20    # reduced from 20
 ATR_ENTRY_BAND   = 1.0   # price must be within 1x ATR of 50 EMA
 
 
