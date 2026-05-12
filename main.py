@@ -68,7 +68,7 @@ PAIR_CONFIGS = {
         "rsi_sell_lo":    35,
         "rsi_sell_hi":    65,
         "atr_stop":       1.5,
-        "atr_target":     3.0,         # 1:2 R:R
+        "atr_target":     2.0,         # 1:1.33 R:R — tighter target, higher win rate
         "max_hold":       20,
 
         # Range entry (Strategy B) — available if regime flips
