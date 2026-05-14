@@ -331,7 +331,7 @@ def get_regime(df, cfg):
     if adx >= cfg["adx_trend_min"]:
         if pdi > ndi and e50 > e200: return "TRENDING", "BULLISH", round(adx, 1)
         if ndi > pdi and e50 < e200: return "TRENDING", "BEARISH", round(adx, 1)
-        return "AMBIGUOUS", "MIXED", round(adx, 1)
+        return "TRENDING", "MIXED", round(adx, 1)
 
     if adx <= cfg["adx_range_max"]:
         return "RANGING", "NEUTRAL", round(adx, 1)
@@ -564,9 +564,9 @@ def strategy_range(df, df_4h, comm_df, cfg):
     bull_candle = l["close"] > l["open"]
     bear_candle = l["close"] < l["open"]
 
-    # BUY at range low
+    # BUY at range low — check SELL-side 4H (fading bearish pressure that created the low)
     if near_low and rsi <= cfg["rsi_oversold"] and bull_candle:
-        h4_ok, h4_checks = get_4h_confirmation(df_4h, "BUY")
+        h4_ok, h4_checks = get_4h_confirmation(df_4h, "SELL")
         if not h4_ok:
             return "BUY_NO4H", None, f"4H contradicts ({h4_checks}/3)", rh, rl, rmid
 
@@ -576,9 +576,9 @@ def strategy_range(df, df_4h, comm_df, cfg):
 
         return "BUY", comm_mod, f"At range low {round(rl,5)} | RSI {round(rsi,1)} oversold | reversal candle | 4H {h4_checks}/3", rh, rl, rmid
 
-    # SELL at range high
+    # SELL at range high — check BUY-side 4H (fading bullish pressure that created the high)
     if near_high and rsi >= cfg["rsi_overbought"] and bear_candle:
-        h4_ok, h4_checks = get_4h_confirmation(df_4h, "SELL")
+        h4_ok, h4_checks = get_4h_confirmation(df_4h, "BUY")
         if not h4_ok:
             return "SELL_NO4H", None, f"4H contradicts ({h4_checks}/3)", rh, rl, rmid
 
@@ -861,7 +861,7 @@ STRATEGY REFERENCE
   Ambiguous zone          ADX between thresholds — STAND DOWN on affected pair
 
 PAIR-SPECIFIC RULES
-  GBP/USD   Trend (ADX>{PAIR_CONFIGS['GBP_USD']['adx_trend_min']}) | 1:{round(PAIR_CONFIGS['GBP_USD']['atr_target']/PAIR_CONFIGS['GBP_USD']['atr_stop'],0):.0f} R:R | Gold preferred
+  GBP/USD   Trend (ADX>{PAIR_CONFIGS['GBP_USD']['adx_trend_min']}) | 1:{PAIR_CONFIGS['GBP_USD']['atr_target']/PAIR_CONFIGS['GBP_USD']['atr_stop']:.2f} R:R | Gold preferred
   EUR/USD   Auto (range primary, trend if ADX>{PAIR_CONFIGS['EUR_USD']['adx_trend_min']}) | Gold preferred
   AUD/USD   Trend (ADX>{PAIR_CONFIGS['AUD_USD']['adx_trend_min']}) | Gold REQUIRED | Risk-on filter
   USD/JPY   Trend (ADX>{PAIR_CONFIGS['USD_JPY']['adx_trend_min']}) | No longs >{PAIR_CONFIGS['USD_JPY']['intervention_long_above']} | No shorts <{PAIR_CONFIGS['USD_JPY']['intervention_short_below']} | 75% size

@@ -208,7 +208,7 @@ def regime_at(df, i):
     if adx > ADX_TREND_MIN:
         if pdi > ndi and e50 > e200: return "TRENDING", "BULLISH"
         if ndi > pdi and e50 < e200: return "TRENDING", "BEARISH"
-        return "AMBIGUOUS", "MIXED"
+        return "TRENDING", "MIXED"
 
     # RANGING: ADX below threshold
     if adx < ADX_RANGE_MAX:

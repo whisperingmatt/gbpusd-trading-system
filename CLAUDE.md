@@ -70,3 +70,33 @@ python main.py
 ## Central Bank Rates
 
 Update `RATES` dict in both files after each central bank meeting. Current rates reflect May 2026 settings.
+
+## Project File Organization
+
+All project files are maintained at:
+`C:\Users\Matthew\OneDrive\Attachments\Desktop\Claude\projects\Trading Systems\`
+
+| Folder | Contents |
+|--------|----------|
+| `01 - Planning` | CLAUDE.md and planning docs |
+| `02 - Strategy` | Strategy documentation |
+| `03 - Research` | Research notes |
+| `04 - Code` | main.py, backtest.py |
+| `05 - Backtests` | Backtest run archives |
+| `06 - Results` | backtest_results.csv, equity_curve.html |
+| `07 - Bots` | Multi-bot framework (see below) |
+
+## Multi-Bot Framework (`07 - Bots`)
+
+Eight specialist bots planned for signal generation and review:
+
+| Bot | Role |
+|-----|------|
+| Bot 1 - Technical | Technical analysis signals |
+| Bot 2 - Macro | Macro / fundamental context |
+| Bot 3 - Sentiment | Market sentiment analysis |
+| Bot 4 - Risk | Risk sizing and exposure limits |
+| Bot 5 - Debate | Challenges signal consensus |
+| Bot 6 - Strategy | Final strategy routing decision |
+| Bot 7 - Memory | Tracks trade history and regime context |
+| Bot 8 - Audit | Post-trade review and performance audit |
