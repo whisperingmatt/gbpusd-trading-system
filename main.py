@@ -5,10 +5,13 @@ Regime-adaptive, pair-specific strategy routing.
 
 import os
 import time
+import json
+import subprocess
 import requests
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from dotenv import load_dotenv
 import schedule
 import pytz
@@ -31,6 +34,7 @@ OANDA_BASE = (
 
 LOT_SIZE         = 100_000
 RISK_PER_TRADE   = 2_000.00   # base USD risk per trade
+DOCS_DIR         = Path(__file__).parent / "docs"
 
 # ─── CENTRAL BANK RATES ──────────────────────────────────────────────────────
 # Update these after each central bank meeting
@@ -894,6 +898,65 @@ Multi-Pair Forex System v3.0 | Pair-Specific Regime-Adaptive""".format(
     print(f"Email sent at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 
+# ─── DASHBOARD UPDATE ─────────────────────────────────────────────────────────
+def update_dashboard(pair_results, events, can_trade, time_mod, tf_msg):
+    """Write docs/system_status.json, append to signal_history.json, then git push."""
+    DOCS_DIR.mkdir(exist_ok=True)
+
+    ny_now = datetime.now(pytz.timezone("America/New_York"))
+
+    status = {
+        "last_updated": ny_now.strftime("%Y-%m-%d %H:%M:%S EST"),
+        "time_filter":  {"can_trade": can_trade, "size_mod": time_mod, "message": tf_msg},
+        "events":       events,
+        "pairs":        {},
+    }
+
+    for r in pair_results:
+        cfg = r["cfg"]
+        pair_data = {k: v for k, v in r.items() if k != "cfg"}
+        pair_data["pair_name"] = cfg["name"]
+        status["pairs"][r["pair"]] = pair_data
+
+    status_path = DOCS_DIR / "system_status.json"
+    with open(status_path, "w") as fh:
+        json.dump(status, fh, indent=2, default=str)
+
+    hist_path = DOCS_DIR / "signal_history.json"
+    if hist_path.exists():
+        with open(hist_path) as fh:
+            history = json.load(fh)
+    else:
+        history = {"history": []}
+
+    history["history"].append({
+        "timestamp": ny_now.strftime("%Y-%m-%dT%H:%M:%S"),
+        "pairs":     status["pairs"],
+    })
+    history["history"] = history["history"][-60:]
+
+    with open(hist_path, "w") as fh:
+        json.dump(history, fh, indent=2, default=str)
+
+    print(f"Dashboard: {status_path}")
+
+    try:
+        repo = str(Path(__file__).parent)
+        subprocess.run(["git", "add", "docs/"], check=True, cwd=repo)
+        msg    = f"Update dashboard {ny_now.strftime('%Y-%m-%d %H:%M EST')}"
+        result = subprocess.run(
+            ["git", "commit", "-m", msg],
+            capture_output=True, text=True, cwd=repo
+        )
+        if result.returncode == 0:
+            subprocess.run(["git", "push", "origin", "main"], check=True, cwd=repo)
+            print("Dashboard pushed to GitHub Pages")
+        else:
+            print("Dashboard: no changes to commit")
+    except Exception as e:
+        print(f"Dashboard git push skipped: {e}")
+
+
 # ─── MAIN JOB ─────────────────────────────────────────────────────────────────
 def run_signal_job():
     print(f"\n{'='*50}")
@@ -952,6 +1015,7 @@ def run_signal_job():
                 })
 
         build_and_send_email(pair_results, events, tf_msg, time_mod)
+        update_dashboard(pair_results, events, can_trade, time_mod, tf_msg)
 
     except Exception as e:
         print(f"Job error: {e}")
