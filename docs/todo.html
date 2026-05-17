@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TODO — Trading System</title>
+<style>
+:root {
+  --bg:     #0d1117;
+  --card:   #161b22;
+  --border: #30363d;
+  --green:  #3fb950;
+  --red:    #f85149;
+  --blue:   #58a6ff;
+  --amber:  #d29922;
+  --text:   #c9d1d9;
+  --muted:  #8b949e;
+  --r:      6px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-monospace, 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  min-height: 100vh;
+}
+
+.wrap { max-width: 900px; margin: 0 auto; padding: 20px 16px 60px; }
+
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  padding: 14px 22px;
+  margin-bottom: 14px;
+}
+.header h1 {
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--blue);
+  letter-spacing: 0.3px;
+}
+.nav-link {
+  font-size: 12px;
+  color: var(--muted);
+  text-decoration: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 12px;
+  transition: color 0.15s, border-color 0.15s;
+}
+.nav-link:hover { color: var(--blue); border-color: var(--blue); }
+
+.sh {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--muted);
+  border-left: 3px solid var(--blue);
+  padding-left: 10px;
+  margin: 22px 0 11px;
+}
+
+.todo-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  overflow: hidden;
+}
+
+.todo-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--border);
+}
+.todo-item:last-child { border-bottom: none; }
+.todo-item:hover { background: rgba(255,255,255,0.025); }
+
+.todo-check {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  margin-top: 1px;
+  border-radius: 50%;
+  border: 1.5px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+}
+.todo-item.done .todo-check {
+  background: rgba(139,148,158,0.15);
+  border-color: var(--muted);
+  color: var(--muted);
+}
+.todo-item.done .todo-check::after { content: '✓'; }
+
+.todo-body { flex: 1; }
+.todo-title {
+  font-size: 13px;
+  color: var(--text);
+  font-weight: 500;
+}
+.todo-item.done .todo-title {
+  color: var(--muted);
+  text-decoration: line-through;
+  text-decoration-color: rgba(139,148,158,0.5);
+}
+.todo-sub {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+.todo-item.done .todo-sub { color: rgba(139,148,158,0.6); }
+
+.todo-tag {
+  flex-shrink: 0;
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 2px 7px;
+  border-radius: 20px;
+  margin-top: 2px;
+}
+.tag-planned { background: rgba(139,148,158,0.1); color: var(--muted); border: 1px solid var(--border); }
+.tag-progress { background: rgba(88,166,255,0.12); color: var(--blue); border: 1px solid rgba(88,166,255,0.25); }
+.tag-done     { background: rgba(63,185,80,0.12);  color: var(--green); border: 1px solid rgba(63,185,80,0.25); }
+.tag-recurring{ background: rgba(210,153,34,0.12); color: var(--amber); border: 1px solid rgba(210,153,34,0.25); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="header">
+    <h1>TODO</h1>
+    <a href="index.html" class="nav-link">&#8592; Dashboard</a>
+  </header>
+
+  <!-- MY LIST -->
+  <div class="sh">My List</div>
+  <div class="todo-card">
+
+    <div class="todo-item">
+      <div class="todo-check"></div>
+      <div class="todo-body">
+        <div class="todo-title">Update RATES dict after each central bank meeting</div>
+        <div class="todo-sub">Edit the <code>RATES</code> dict in both main.py and backtest.py. Current values reflect May 2026 settings.</div>
+      </div>
+      <span class="todo-tag tag-recurring">Recurring</span>
+    </div>
+
+    <div class="todo-item">
+      <div class="todo-check"></div>
+      <div class="todo-body">
+        <div class="todo-title">Archive backtest run results to 05&nbsp;- Backtests</div>
+        <div class="todo-sub">Copy backtest_results.csv and equity_curve.html after each significant run.</div>
+      </div>
+      <span class="todo-tag tag-recurring">Recurring</span>
+    </div>
+
+    <div class="todo-item">
+      <div class="todo-check"></div>
+      <div class="todo-body">
+        <div class="todo-title">Log live trades to the dashboard</div>
+        <div class="todo-sub">Run <code>python docs/add_trade.py</code> after each trade to keep the trade log and equity curve current.</div>
+      </div>
+      <span class="todo-tag tag-recurring">Recurring</span>
+    </div>
+
+  </div>
+
+  <!-- CLAUDE LIST -->
+  <div class="sh">Claude List</div>
+  <div class="todo-card">
+
+    <div class="todo-item">
+      <div class="todo-check"></div>
+      <div class="todo-body">
+        <div class="todo-title">Bot 1 — Technical</div>
+        <div class="todo-sub">Technical analysis signals</div>
+      </div>
+      <span class="todo-tag tag-planned">Planned</span>
+    </div>
+
+    <div class="todo-item">
+      <div class="todo-check"></div>
+      <div class="todo-body">
+        <div class="todo-title">Bot 2 — Macro</div>
+        <div class="todo-sub">Macro / fundamental context</div>
+      </div>
+      <span class="todo-tag tag-planned">Planned</span>
+    </div>
+
+    <div class="todo-item">
+      <div class="todo-check"></div>
+      <div class="todo-body">
+        <div class="todo-title">Bot 3 — Sentiment</div>
+        <div class="todo-sub">Market sentiment analysis</div>
+      </div>
+      <span class="todo-tag tag-planned">Planned</span>
+    </div>
+
+    <div class="todo-item">
+      <div class="todo-check"></div>
+      <div class="todo-body">
+        <div class="todo-title">Bot 4 — Risk</div>
+        <div class="todo-sub">Risk sizing and exposure limits</div>
+      </div>
+      <span class="todo-tag tag-planned">Planned</span>
+    </div>
+
+    <div class="todo-item">
+      <div class="todo-check"></div>
+      <div class="todo-body">
+        <div class="todo-title">Bot 5 — Debate</div>
+        <div class="todo-sub">Challenges signal consensus</div>
+      </div>
+      <span class="todo-tag tag-planned">Planned</span>
+    </div>
+
+    <div class="todo-item">
+      <div class="todo-check"></div>
+      <div class="todo-body">
+        <div class="todo-title">Bot 6 — Strategy</div>
+        <div class="todo-sub">Final strategy routing decision</div>
+      </div>
+      <span class="todo-tag tag-planned">Planned</span>
+    </div>
+
+    <div class="todo-item">
+      <div class="todo-check"></div>
+      <div class="todo-body">
+        <div class="todo-title">Bot 7 — Memory</div>
+        <div class="todo-sub">Tracks trade history and regime context</div>
+      </div>
+      <span class="todo-tag tag-planned">Planned</span>
+    </div>
+
+    <div class="todo-item">
+      <div class="todo-check"></div>
+      <div class="todo-body">
+        <div class="todo-title">Bot 8 — Audit</div>
+        <div class="todo-sub">Post-trade review and performance audit</div>
+      </div>
+      <span class="todo-tag tag-planned">Planned</span>
+    </div>
+
+  </div>
+
+</div>
+</body>
+</html>
